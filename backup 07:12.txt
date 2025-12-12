@@ -1,0 +1,448 @@
+import re
+import streamlit as st
+import altair as alt
+import pandas as pd
+from PIL import Image
+import pytesseract
+
+# --- CONFIGURAÇÕES E DADOS PADRÃO ---
+FATORES_COMPLEXIDADE = {
+    "Simples (Logo/Peito)": {"fator_velocidade": 1.0, "consumo_ml": 1.0},
+    "Normal (A4 Colorido)": {"fator_velocidade": 0.9, "consumo_ml": 5.0},
+    "Complexa (A3 Chapado)": {"fator_velocidade": 0.6, "consumo_ml": 8.0},
+    "Artística (HD/Fine Art)": {"fator_velocidade": 0.5, "consumo_ml": 10.0}
+}
+
+
+def extrair_consumo_de_imagem(uploaded_file):
+    try:
+        from PIL import Image
+    except Exception as exc:
+        return None, f"Erro ao carregar PIL: {exc}"
+
+    try:
+        img = Image.open(uploaded_file)
+    except Exception as exc:
+        return None, f"Não foi possível abrir o arquivo: {exc}"
+
+    meta_textos = []
+    # Captura metadados conhecidos
+    if hasattr(img, "info"):
+        meta_textos.extend([str(v) for v in img.info.values() if v])
+    if hasattr(img, "text"):
+        meta_textos.extend([str(v) for v in img.text.values() if v])
+    try:
+        if hasattr(img, "tag_v2"):
+            meta_textos.extend([str(v) for v in img.tag_v2.values() if v])
+    except Exception:
+        pass
+    
+    # Fallback: varre o conteúdo bruto
+    try:
+        raw_bytes = uploaded_file.getvalue()
+        if raw_bytes:
+            meta_textos.append(raw_bytes.decode("latin-1", errors="ignore"))
+            meta_textos.append(raw_bytes.decode("utf-8", errors="ignore"))
+            meta_textos.append(raw_bytes.decode("utf-16", errors="ignore"))
+            meta_textos.append(raw_bytes.replace(b"\x00", b"").decode("latin-1", errors="ignore"))
+            raw_clean = re.sub(r"[^A-Za-z0-9\\.,:=\\s]", " ", raw_bytes.replace(b"\x00", b"").decode("latin-1", errors="ignore"))
+            meta_textos.append(raw_clean)
+    except Exception:
+        pass
+
+    if not meta_textos:
+        return None, "Imagem não possui metadados legíveis."
+
+    def _to_float(num_str):
+        if not num_str: return None
+        cleaned = num_str.replace(",", ".")
+        if not re.search(r"\d", cleaned): return None
+        try: return float(cleaned)
+        except ValueError: return None
+
+    def dedup_matches(matches):
+        seen = set()
+        uniq = []
+        for m in matches:
+            key = (m.get("campo"), m.get("bruto"), m.get("valor"))
+            if key in seen: continue
+            seen.add(key)
+            uniq.append(m)
+        return uniq
+
+    def parse_totais(blob_text):
+        debug_local = []
+        def _pick_last(patterns, label):
+            last_val = None
+            for pat in patterns:
+                for m in re.finditer(pat, blob_text, flags=re.IGNORECASE):
+                    val = _to_float(m.group(1))
+                    if val is not None: last_val = val
+            if last_val is not None:
+                debug_local.append({"campo": label, "valor": last_val})
+            return last_val
+
+        total_c = _pick_last([r"\bTotal\s*C\s*[:=]?\s*([\d\.,]+)", r"\bTotalC\s*[:=]?\s*([\d\.,]+)", r"\bTotal\s*Colors?\s*[:=]?\s*([\d\.,]+)"], "Total C")
+        total_w = _pick_last([r"\bTotal\s*W\s*[:=]?\s*([\d\.,]+)", r"\bTotalWhite\s*[:=]?\s*([\d\.,]+)", r"\bTotal\s*White\s*[:=]?\s*([\d\.,]+)"], "Total W")
+        total_q = _pick_last([r"\bTotal\s*Q(?:fix)?\s*[:=]?\s*([\d\.,]+)", r"\bQfix\s*[:=]?\s*([\d\.,]+)", r"\bTotal\s*Q\s*[:=]?\s*([\d\.,]+)"], "Total Q")
+        total_all = _pick_last([r"\bTotal\s*[:=]?\s*([\d\.,]+)"], "Total (geral)")
+
+        uniq_debug = []
+        seen = set()
+        for d in debug_local:
+            if d["campo"] in seen: continue
+            seen.add(d["campo"])
+            uniq_debug.append(d)
+        return total_c, total_w, total_q, total_all, uniq_debug
+
+    def parse_canais(blob_text):
+        resultado = []
+        padroes = [
+            ("C", r"(?m)^\s*C\s*[=:]\s*([\d\.,]+)"), ("M", r"(?m)^\s*M\s*[=:]\s*([\d\.,]+)"),
+            ("Y", r"(?m)^\s*Y\s*[=:]\s*([\d\.,]+)"), ("K", r"(?m)^\s*K\s*[=:]\s*([\d\.,]+)"),
+            ("Ny", r"(?m)^\s*Ny\s*[=:]\s*([\d\.,]+)"), ("Np", r"(?m)^\s*Np\s*[=:]\s*([\d\.,]+)"),
+            ("Qc", r"(?m)^\s*Qc\s*[=:]\s*([\d\.,]+)"), ("Qw", r"(?m)^\s*Qw\s*[=:]\s*([\d\.,]+)"),
+            ("PE", r"(?m)^\s*PE\s*[=:]\s*([\d\.,]+)"), ("W", r"(?m)^\s*W\s*[=:]\s*([\d\.,]+)"),
+            ("PG", r"(?m)^\s*PG\s*[=:]\s*([\d\.,]+)"),
+        ]
+        for canal, padrao in padroes:
+            last_val = None
+            for m in re.finditer(padrao, blob_text, flags=re.IGNORECASE):
+                val = _to_float(m.group(1))
+                if val is not None: last_val = val
+            if last_val is not None: resultado.append({"canal": canal, "valor": last_val})
+        return resultado
+
+    blob = " ".join(meta_textos)
+    total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob)
+    canais_consumo = parse_canais(blob)
+
+    if not any([total_c, total_w, total_q, total_all]):
+        try:
+            import pytesseract
+            ocr_text = pytesseract.image_to_string(img.convert("RGB"))
+            if ocr_text:
+                meta_textos.append(ocr_text)
+                blob_ocr = " ".join(meta_textos)
+                total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob_ocr)
+                canais_consumo = parse_canais(blob_ocr)
+                if debug_matches:
+                     debug_matches.append({"campo": "Fonte", "valor": 0, "bruto": "OCR"})
+        except Exception: pass
+
+    if any([total_c, total_w, total_q]):
+        total_ml = sum([v for v in [total_c, total_w, total_q] if v is not None])
+        return {
+            "cmyk_ml": total_c or 0.0, "white_ml": total_w or 0.0, "qfix_ml": total_q or 0.0,
+            "total_ml": total_ml if total_ml > 0 else total_all or 0.0,
+            "debug_matches": dedup_matches(debug_matches), "canais_consumo": dedup_matches(canais_consumo)
+        }, None
+
+    if total_all:
+        return {
+            "cmyk_ml": total_all, "white_ml": 0.0, "qfix_ml": 0.0, "total_ml": total_all,
+            "debug_matches": dedup_matches(debug_matches), "canais_consumo": dedup_matches(canais_consumo)
+        }, None
+
+    blob_slim = re.sub(r"\s+", " ", " ".join(meta_textos))
+    return None, f"Não encontrei padrões de consumo nos metadados. Prévia: '{blob_slim[:240]}...'"
+
+def calcular_custo_total(
+    qtd_pedido, velocidade_nominal, eficiencia, complexidade_nome, equipe_salarios, encargos, setup_min,
+    cotacao_usd_brl, preco_tinta_litro, moeda_tinta, preco_tinta_ml_manual, consumo_override, fixation_percent,
+    custo_energia_kwh, moeda_base, horas_mes, consumo_maquina_kw, consumo_forno_kw
+):
+    def converter_para_base(valor, moeda_valor):
+        if moeda_valor == moeda_base: return valor
+        if cotacao_usd_brl <= 0: return None
+        if moeda_valor == "USD" and moeda_base == "BRL": return valor * cotacao_usd_brl
+        if moeda_valor == "BRL" and moeda_base == "USD": return valor / cotacao_usd_brl
+        return valor
+
+    if consumo_override:
+        fator_vel = FATORES_COMPLEXIDADE[complexidade_nome]["fator_velocidade"]
+        consumo_ml = consumo_override["total_ml"]
+    else:
+        dados_complexidade = FATORES_COMPLEXIDADE[complexidade_nome]
+        fator_vel = dados_complexidade["fator_velocidade"]
+        consumo_ml = dados_complexidade["consumo_ml"]
+    
+    fix_ml = consumo_ml * (fixation_percent / 100)
+    consumo_ml_total = consumo_ml + fix_ml
+
+    total_salarios = sum(equipe_salarios.values())
+    if horas_mes <= 0: return "Erro: Horas mensais devem ser > 0."
+    custo_mensal_equipe = total_salarios * (1 + encargos)
+    custo_hora_equipe = custo_mensal_equipe / horas_mes
+    custo_minuto_equipe = custo_hora_equipe / 60
+
+    vel_real = velocidade_nominal * eficiencia * fator_vel
+    if vel_real == 0: return "Erro: Velocidade zero."
+
+    tempo_impressao_min = qtd_pedido / (vel_real / 60)
+    tempo_total_min = tempo_impressao_min + setup_min
+    
+    custo_total_mo = tempo_total_min * custo_minuto_equipe
+    custo_unit_mo = custo_total_mo / qtd_pedido
+
+    if preco_tinta_ml_manual is not None:
+        custo_tinta_ml_base = preco_tinta_ml_manual
+        preco_litro_base = custo_tinta_ml_base * 1000
+    else:
+        preco_litro_base = converter_para_base(preco_tinta_litro, moeda_tinta)
+        if preco_litro_base is None: return "Erro: Cotação inválida."
+        custo_tinta_ml_base = preco_litro_base / 1000
+    custo_tinta_unit = consumo_ml_total * custo_tinta_ml_base * 1.10
+    
+    consumo_total_kw = consumo_maquina_kw + consumo_forno_kw
+    horas_job = tempo_total_min / 60
+    total_kwh_job = horas_job * consumo_total_kw
+    custo_energia_total = total_kwh_job * custo_energia_kwh
+    custo_energia_unit = custo_energia_total / qtd_pedido
+    custo_hora_energia = consumo_total_kw * custo_energia_kwh
+
+    custo_unit_total = custo_unit_mo + custo_tinta_unit + custo_energia_unit
+
+    return {
+        "vel_real": vel_real, "tempo_horas": tempo_total_min / 60,
+        "custo_mo_unit": custo_unit_mo, "custo_tinta_unit": custo_tinta_unit,
+        "custo_energia_unit": custo_energia_unit, "custo_final_unit": custo_unit_total,
+        "ml_base": consumo_ml, "ml_fixation": fix_ml, "ml_por_peca": consumo_ml_total,
+        "ml_cmyk": consumo_override["cmyk_ml"] if consumo_override else None,
+        "ml_white": consumo_override["white_ml"] if consumo_override else None,
+        "ml_qfix": consumo_override["qfix_ml"] if consumo_override else None,
+        "preco_tinta_ml_base": custo_tinta_ml_base, "preco_tinta_litro_base": preco_litro_base,
+        "horas_mes": horas_mes, "custo_hora_equipe": custo_hora_equipe,
+        "custo_hora_energia": custo_hora_energia, "consumo_total_kw": consumo_total_kw,
+        "custo_energia_kwh": custo_energia_kwh
+    }
+
+def main():
+    st.set_page_config(page_title="Calculadora DTG Pro", page_icon="👕", layout="wide")
+    
+    st.title("👕 Calculadora de Custos DTG (Kornit)")
+    st.markdown("---")
+
+    st.markdown("### Entradas Gerais")
+    c_econ, c_insumo, c_team = st.columns(3, gap="large")
+
+    with c_econ:
+        st.subheader("1. Cenário Econômico")
+        moeda_base = st.selectbox("Moeda base", ["USD", "BRL"], 0, format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)")
+        simbolo_base = "US$" if moeda_base == "USD" else "R$"
+        dolar = st.number_input("Cotação USD -> BRL", 5.50, step=0.01)
+        kwh = st.number_input(f"Custo Energia ({simbolo_base}/kWh)", 0.85, step=0.01)
+        consumo_maquina_kw = st.number_input("Impressora (kW)", 3.5, step=0.1)
+        consumo_forno_kw = st.number_input("Forno (kW)", 4.0, step=0.1)
+        st.caption(f"Energia Estimada: {simbolo_base} {((consumo_maquina_kw+consumo_forno_kw)*kwh):.2f}/h")
+
+    with c_insumo:
+        st.subheader("2. Insumos")
+        modo_preco = st.radio("Preço Tinta", ["Por Litro", "Por ml (Direto)"])
+        preco_tinta_ml_manual = None
+        preco_tinta_litro = 0.0
+        moeda_tinta = "USD"
+        if modo_preco == "Por Litro":
+            moeda_tinta = st.selectbox("Moeda Litro", ["USD", "BRL"], 0)
+            preco_tinta_litro = st.number_input("Preço Litro", 160.0, step=1.0)
+        else:
+            preco_tinta_ml_manual = st.number_input(f"Custo ml ({simbolo_base})", 0.16, step=0.01, format="%.3f")
+
+    with c_team:
+        st.subheader("3. Equipe")
+        sal_op = st.number_input(f"Op. ({simbolo_base})", 3000.0)
+        sal_aj = st.number_input(f"Aj. ({simbolo_base})", 2500.0)
+        encargos = st.number_input("Encargos (%)", 0.80)
+        horas_mes = st.number_input("Horas/mês", 220, step=10)
+        if st.button("🔄 Resetar", type="secondary"):
+            st.session_state.clear()
+            st.rerun()
+
+    col_input, col_result = st.columns([1, 1.5], gap="medium")
+
+    with col_input:
+        st.subheader("📦 Dados do Pedido")
+        qtd = st.number_input("Quantidade", 1000, step=50)
+        complexidade = st.selectbox("Complexidade", list(FATORES_COMPLEXIDADE.keys()), 1)
+        modo_consumo = st.radio("Consumo de Tinta", ["Padrão", "Manual", "Arquivo (PNG/TIFF)"])
+        arquivo = None
+        manual_disabled = modo_consumo != "Manual"
+        file_disabled = modo_consumo != "Arquivo (PNG/TIFF)"
+        fixation_percent = st.number_input("Fixation (%)", 10.0, step=0.5)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            c_cmyk = st.number_input("CMYK ml", 4.0, step=0.1, disabled=manual_disabled)
+            c_qfix = st.number_input("Qfix ml", 0.5, step=0.1, disabled=manual_disabled)
+        with c2:
+            c_white = st.number_input("White ml", 1.5, step=0.1, disabled=manual_disabled)
+
+        st.info("Upload PNG/TIFF (CPP Tool) para leitura automática.")
+        arquivo = st.file_uploader("Arquivo", ["png", "tif", "tiff"], key="up_cpp", disabled=file_disabled)
+
+        consumo_override = None
+        if not manual_disabled:
+            consumo_override = {"cmyk_ml": c_cmyk, "white_ml": c_white, "qfix_ml": c_qfix, "total_ml": c_cmyk+c_white+c_qfix}
+        elif not file_disabled and arquivo:
+            consumo_override, erro = extrair_consumo_de_imagem(arquivo)
+            if erro: st.error(erro)
+            else:
+                # --- NOVO LAYOUT DE ANÁLISE DE ARQUIVO (MODERNO) ---
+                st.markdown("### 🧬 Análise do Arquivo")
+                
+                # Cards de Métricas (Dashboard Style)
+                met1, met2, met3 = st.columns(3)
+                met1.metric("Total Tinta", f"{consumo_override['total_ml']:.2f} ml", delta_color="off")
+                met2.metric("Branco (W)", f"{consumo_override['white_ml']:.2f} ml")
+                met3.metric("CMYK", f"{consumo_override['cmyk_ml']:.2f} ml")
+
+                dm = consumo_override.get("debug_matches", [])
+                cc = consumo_override.get("canais_consumo", [])
+                
+                # Abas para separar visual de dados técnicos
+                tab_visual, tab_dados = st.tabs(["📊 Gráficos de Consumo", "📋 Dados Técnicos"])
+                
+                with tab_visual:
+                    if cc:
+                        color_map = {
+                            "C": "#00bcd4", "M": "#d500f9", "Y":"#ffeb3b", "K":"#212121", 
+                            "W":"#e0e0e0", "Qc":"#29b6f6", "Qw":"#81d4fa",
+                            "Ny": "#ce93d8", "Np": "#bcaaa4", "PE": "#9575cd", "PG": "#66bb6a"
+                        }
+                        df_s = pd.DataFrame(cc)
+                        df_s["cor"] = df_s["canal"].map(color_map).fillna("#9e9e9e")
+                        
+                        # Gráfico de Barras Horizontais (Moderno e Limpo)
+                        chart_canais = alt.Chart(df_s).mark_bar(cornerRadius=5, size=25).encode(
+                            x=alt.X("valor:Q", title="Volume (ml)", axis=alt.Axis(grid=False)),
+                            y=alt.Y("canal:N", sort="-x", title=None, axis=alt.Axis(labelFontSize=14, labelFontWeight="bold")),
+                            color=alt.Color("cor:N", scale=None, legend=None),
+                            tooltip=["canal", "valor"]
+                        ).properties(height=350)
+                        
+                        text_canais = chart_canais.mark_text(
+                            align='left', baseline='middle', dx=3, color='black'
+                        ).encode(text=alt.Text("valor:Q", format=".2f"))
+                        
+                        st.altair_chart((chart_canais + text_canais).configure_view(strokeWidth=0), use_container_width=True)
+                    
+                    elif dm:
+                        # Fallback se só tiver totais
+                        df_tot = pd.DataFrame(dm)
+                        df_p = df_tot[df_tot["campo"].isin(["Total C", "Total W", "Total Q", "Total (geral)"])]
+                        if not df_p.empty:
+                            c_donut = alt.Chart(df_p).mark_arc(innerRadius=60).encode(
+                                theta=alt.Theta("valor:Q", stack=True),
+                                color=alt.Color("campo:N", scale=alt.Scale(scheme="category10"), legend=alt.Legend(title="Tipo")),
+                                tooltip=["campo", "valor"]
+                            ).properties(height=300)
+                            st.altair_chart(c_donut, use_container_width=True)
+
+                with tab_dados:
+                    if dm:
+                        st.caption("Metadados extraídos:")
+                        st.dataframe(pd.DataFrame(dm)[["campo", "valor"]], use_container_width=True, height=150)
+                    if cc:
+                        st.caption("Canais brutos:")
+                        st.dataframe(pd.DataFrame(cc)[["canal", "valor"]], use_container_width=True, height=200)
+
+        st.markdown("---")
+        vel_nominal = st.number_input("Velocidade (pçs/h)", 120)
+        eficiencia = st.slider("Eficiência", 0.4, 1.0, 0.70)
+        setup = st.number_input("Setup (min)", 15)
+        
+        calc_btn = st.button("💰 Calcular Custos", type="primary", disabled=(modo_consumo=="Arquivo (PNG/TIFF)" and not arquivo))
+
+    if calc_btn:
+        res = calcular_custo_total(
+            qtd, vel_nominal, eficiencia, complexidade, {"Op": sal_op, "Aj": sal_aj}, 
+            encargos, setup, dolar, preco_tinta_litro, moeda_tinta, preco_tinta_ml_manual, 
+            consumo_override, fixation_percent, kwh, moeda_base, horas_mes, consumo_maquina_kw, consumo_forno_kw
+        )
+        if isinstance(res, str):
+            st.error(res)
+            return
+
+        with col_result:
+            st.subheader("📊 Resultado Financeiro")
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Custo Unitário", f"{simbolo_base} {res['custo_final_unit']:.2f}")
+            k2.metric("Tempo Total", f"{res['tempo_horas']:.1f} h")
+            k3.metric("Velocidade Real", f"{int(res['vel_real'])} pçs/h")
+
+            # --- GRÁFICOS DO RESULTADO (3x4 GRANDE) ---
+            
+            st.markdown("### Visão Geral de Custos")
+            col_chart_a, col_chart_b = st.columns(2, gap="large")
+
+            with col_chart_a:
+                df_hora = pd.DataFrame([
+                    {"Tipo": "Mão de Obra", "Valor": res["custo_hora_equipe"]},
+                    {"Tipo": "Energia", "Valor": res["custo_hora_energia"]}
+                ])
+                base_hora = alt.Chart(df_hora).encode(
+                    x=alt.X("Tipo:N", axis=alt.Axis(labelAngle=0, title=None), scale=alt.Scale(padding=0.4)),
+                    y=alt.Y("Valor:Q", title=f"Valor ({simbolo_base})"),
+                    tooltip=["Tipo", alt.Tooltip("Valor", format=".2f")]
+                )
+                bars_hora = base_hora.mark_bar(cornerRadius=10, size=80).encode(
+                    color=alt.Color("Tipo:N", scale=alt.Scale(scheme="tealblues"), legend=None)
+                )
+                text_hora = base_hora.mark_text(dy=-15, fontSize=16, fontWeight='bold').encode(
+                    text=alt.Text("Valor:Q", format=".2f")
+                )
+                st.altair_chart((bars_hora + text_hora).properties(height=420).configure_axis(grid=False).configure_view(stroke=None), use_container_width=True)
+
+            with col_chart_b:
+                df_unit = pd.DataFrame([
+                    {"Item": "M. Obra", "Custo": res["custo_mo_unit"]},
+                    {"Item": "Tinta", "Custo": res["custo_tinta_unit"]},
+                    {"Item": "Energia", "Custo": res["custo_energia_unit"]},
+                ])
+                base_unit = alt.Chart(df_unit).encode(
+                    x=alt.X("Item:N", sort=["M. Obra", "Tinta", "Energia"], axis=alt.Axis(labelAngle=0, title=None), scale=alt.Scale(padding=0.3)),
+                    y=alt.Y("Custo:Q", title=None),
+                    tooltip=["Item", alt.Tooltip("Custo", format=".2f")]
+                )
+                bars_unit = base_unit.mark_bar(cornerRadius=10, size=80).encode(
+                    color=alt.Color("Item:N", scale=alt.Scale(scheme="orangered"), legend=None)
+                )
+                text_unit = base_unit.mark_text(dy=-15, fontSize=16, fontWeight='bold').encode(
+                    text=alt.Text("Custo:Q", format=".2f")
+                )
+                st.altair_chart((bars_unit + text_unit).properties(height=420).configure_axis(grid=False).configure_view(stroke=None), use_container_width=True)
+
+            # 3. DETALHE TINTA
+            if res["ml_cmyk"]:
+                st.markdown("### Consumo de Tinta (ml)")
+                df_ink = pd.DataFrame([
+                    {"Cor": "CMYK", "ml": res["ml_cmyk"], "hex": "#00bcd4"},
+                    {"Cor": "White", "ml": res["ml_white"], "hex": "#d9d9d9"},
+                    {"Cor": "Qfix", "ml": res["ml_qfix"], "hex": "#f9a825"},
+                    {"Cor": "Fixation", "ml": res["ml_fixation"], "hex": "#546e7a"},
+                ])
+                
+                base_ink = alt.Chart(df_ink).encode(
+                    x=alt.X("Cor:N", sort=["CMYK", "White", "Qfix", "Fixation"], axis=alt.Axis(labelAngle=0, title=None), scale=alt.Scale(padding=0.3)),
+                    y=alt.Y("ml:Q", title="ml"),
+                    tooltip=["Cor", alt.Tooltip("ml", format=".2f")]
+                )
+                bars_ink = base_ink.mark_bar(cornerRadius=10, size=60).encode(
+                    color=alt.Color("hex:N", scale=None, legend=None)
+                )
+                text_ink = base_ink.mark_text(dy=-15, fontSize=14, fontWeight='bold').encode(
+                    text=alt.Text("ml:Q", format=".2f")
+                )
+                
+                st.altair_chart((bars_ink + text_ink).properties(height=450).configure_axis(grid=False).configure_view(stroke=None), use_container_width=True)
+
+            # Barras de Progresso
+            st.markdown("---")
+            st.caption("Distribuição percentual:")
+            total = res['custo_final_unit']
+            st.progress(res['custo_mo_unit']/total, f"M.O.: {simbolo_base} {res['custo_mo_unit']:.2f}")
+            st.progress(res['custo_tinta_unit']/total, f"Tinta: {simbolo_base} {res['custo_tinta_unit']:.2f}")
+            st.progress(res['custo_energia_unit']/total, f"Energia: {simbolo_base} {res['custo_energia_unit']:.2f}")
+
+if __name__ == "__main__":
+    main()

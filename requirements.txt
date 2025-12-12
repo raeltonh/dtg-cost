@@ -1,6 +1,7 @@
-streamlit
-pandas
-Pillow
-numpy
-reportlab
-pytesseract
+streamlit>=1.30,<2
+pandas>=2.1,<2.3
+Pillow>=9.0,<12
+numpy>=1.26,<2.3
+reportlab>=4.0,<5
+pytesseract>=0.3.10,<0.4
+altair>=5.2,<6

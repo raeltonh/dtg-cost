@@ -13,6 +13,7 @@ FATORES_COMPLEXIDADE = {
     "Artistic (HD/Fine Art)": {"fator_velocidade": 0.5, "consumo_ml": 10.0}
 }
 
+
 def extrair_consumo_de_imagem(uploaded_file):
     try:
         from PIL import Image
@@ -344,16 +345,7 @@ def calcular_custo_total(
     extras_monthly_total,
     extras_per_piece_total,
     service_allocation_method,
-    expected_monthly_pcs,
-    press_enabled,
-    press_cycle_seconds,
-    press_kw,
-    press_value,
-    press_dep_months,
-    press_use_same_labor,
-    press_operator_salary,
-    designer_salary,
-    design_time_hours
+    expected_monthly_pcs
 ):
     def converter_para_base(valor, moeda_valor):
         if moeda_valor == moeda_base: return valor
@@ -379,13 +371,6 @@ def calcular_custo_total(
     custo_hora_equipe = custo_mensal_equipe / horas_mes
     custo_minuto_equipe = custo_hora_equipe / 60
 
-    # Heat press labor rate (optional dedicated operator)
-    press_custo_hora = float(custo_hora_equipe)
-    if not press_use_same_labor:
-        press_sal = float(press_operator_salary) if press_operator_salary is not None else 0.0
-        press_custo_mensal = press_sal * (1 + encargos)
-        press_custo_hora = (press_custo_mensal / horas_mes) if horas_mes > 0 else 0.0
-
     vel_real = velocidade_nominal * eficiencia * fator_vel
     if vel_real == 0: return "Error: zero speed."
 
@@ -394,26 +379,6 @@ def calcular_custo_total(
     
     custo_total_mo = tempo_total_min * custo_minuto_equipe
     custo_unit_mo = custo_total_mo / qtd_pedido
-
-    # -------------------------------------------------
-    # Optional prepress/design labor (one-time per job)
-    # Allocated across the order quantity
-    # -------------------------------------------------
-    custo_hora_designer = 0.0
-    custo_design_total = 0.0
-    custo_design_unit = 0.0
-    designer_hours_job = 0.0
-
-    if design_time_hours and float(design_time_hours) > 0 and horas_mes > 0:
-        base_sal_designer = float(designer_salary) if designer_salary is not None else 0.0
-        if base_sal_designer > 0:
-            custo_hora_designer = (base_sal_designer * (1 + float(encargos))) / float(horas_mes)
-        else:
-            custo_hora_designer = 0.0
-
-        designer_hours_job = float(design_time_hours)
-        custo_design_total = designer_hours_job * float(custo_hora_designer)
-        custo_design_unit = (custo_design_total / float(qtd_pedido)) if qtd_pedido > 0 else 0.0
 
     if preco_tinta_ml_manual is not None:
         custo_tinta_ml_base = preco_tinta_ml_manual
@@ -431,42 +396,12 @@ def calcular_custo_total(
     custo_energia_unit = custo_energia_total / qtd_pedido
     custo_hora_energia = consumo_total_kw * custo_energia_kwh
 
-    # Depreciation (hour and unit) - main printer
-    dep_hour = machine_value / dep_months / horas_mes if dep_months > 0 and horas_mes > 0 else 0.0
-    dep_unit = dep_hour * horas_job / qtd_pedido if qtd_pedido > 0 else 0.0
+    # Depreciation (hour and unit)
+    dep_hour = machine_value / dep_months / horas_mes if dep_months > 0 and horas_mes > 0 else 0
+    dep_unit = dep_hour * horas_job / qtd_pedido
 
     # Blank T-shirt cost (per unit)
-    tshirt_unit = float(tshirt_cost)
-
-    # -------------------------------------------------
-    # Optional finishing: Heat Press (Sublimation press)
-    # Includes extra labor time, energy and press depreciation
-    # -------------------------------------------------
-    press_labor_unit = 0.0
-    press_energy_unit = 0.0
-    press_dep_unit = 0.0
-    press_unit_total = 0.0
-    press_dep_hour = 0.0
-    press_hours_job = 0.0
-
-    if press_enabled and press_cycle_seconds and press_cycle_seconds > 0 and qtd_pedido > 0:
-        # Total press time based on seconds per piece
-        press_hours_job = (float(press_cycle_seconds) * float(qtd_pedido)) / 3600.0
-
-        # Labor cost for press operation (same as printing or dedicated operator)
-        press_labor_total = press_hours_job * float(press_custo_hora)
-        press_labor_unit = press_labor_total / float(qtd_pedido)
-
-        # Energy cost for the press
-        press_kwh_job = press_hours_job * float(press_kw)
-        press_energy_total = press_kwh_job * float(custo_energia_kwh)
-        press_energy_unit = press_energy_total / float(qtd_pedido)
-
-        # Depreciation for the press
-        press_dep_hour = (float(press_value) / float(press_dep_months) / float(horas_mes)) if press_dep_months > 0 and horas_mes > 0 else 0.0
-        press_dep_unit = press_dep_hour * press_hours_job / float(qtd_pedido)
-
-        press_unit_total = press_labor_unit + press_energy_unit + press_dep_unit
+    tshirt_unit = tshirt_cost
 
     # Service & platform fees
     # Two allocation methods:
@@ -506,11 +441,11 @@ def calcular_custo_total(
     )
 
     custo_unit_total = custo_unit_mo + custo_tinta_unit + custo_energia_unit
-    custo_unit_total += dep_unit + tshirt_unit + service_platform_unit + press_unit_total + custo_design_unit
+    custo_unit_total += dep_unit + tshirt_unit + service_platform_unit
 
     return {
         "vel_real": vel_real, "tempo_horas": tempo_total_min / 60,
-        "custo_mo_unit": custo_unit_mo, "custo_design_unit": custo_design_unit, "custo_tinta_unit": custo_tinta_unit,
+        "custo_mo_unit": custo_unit_mo, "custo_tinta_unit": custo_tinta_unit,
         "custo_energia_unit": custo_energia_unit,
         "custo_dep_unit": dep_unit,
         "custo_tshirt_unit": tshirt_unit,
@@ -523,13 +458,6 @@ def calcular_custo_total(
         "custo_service_hour": service_hour,
         "custo_platform_hour": platform_hour,
         "custo_extras_hour": extras_hour,
-        "custo_press_labor_unit": press_labor_unit,
-        "custo_press_energy_unit": press_energy_unit,
-        "custo_press_dep_unit": press_dep_unit,
-        "custo_press_unit": press_unit_total,
-        "custo_press_dep_hour": press_dep_hour,
-        "press_hours_job": press_hours_job,
-        "custo_press_hour_total": (press_dep_hour + (float(press_kw) * float(custo_energia_kwh)) + float(press_custo_hora)) if press_enabled else 0.0,
         "custo_final_unit": custo_unit_total,
         "ml_base": consumo_ml, "ml_fixation": fix_ml, "ml_por_peca": consumo_ml_total,
         "ml_cmyk": consumo_override["cmyk_ml"] if consumo_override else None,
@@ -538,8 +466,6 @@ def calcular_custo_total(
         "preco_tinta_ml_base": custo_tinta_ml_base, "preco_tinta_litro_base": preco_litro_base,
         "horas_mes": horas_mes,
         "custo_hora_equipe": custo_hora_equipe,
-        "custo_hora_designer": custo_hora_designer,
-        "custo_hora_press": press_custo_hora,
         "custo_hora_energia": custo_hora_energia,
         "custo_dep_hour": dep_hour,
         "custo_service_platform_hour": (service_hour + platform_hour + extras_hour),
@@ -559,7 +485,7 @@ def main():
     if "consumo_file" not in st.session_state:
         st.session_state["consumo_file"] = None
     
-    st.title("👕 DTG Cost Calculator")
+    st.title("👕 DTG Cost Calculator (Kornit)")
     st.markdown("---")
 
     st.markdown("### General Inputs")
@@ -644,22 +570,6 @@ def main():
             f"Assistant ({simbolo_base})",
             value=2500.0,
             help="Monthly base salary for the assistant/second operator."
-        )
-        sal_designer = st.number_input(
-            f"Designer ({simbolo_base})",
-            value=0.0,
-            step=100.0,
-            help="Monthly base salary for the designer/prepress resource (optional)."
-        )
-
-        design_time_hours = st.number_input(
-            "Estimated design effort for this order (hours)",
-            value=0.0,
-            step=0.5,
-            help=(
-                "Total design/prepress effort for this order (in hours, not per-piece). "
-                "The value is allocated across the order quantity and added to the unit cost."
-            )
         )
         encargos = st.number_input(
             "Labor burden / overhead (%)",
@@ -859,150 +769,18 @@ def main():
         },
     )
 
-    extras_monthly_total = 0.0
-    extras_per_piece_total = 0.0
-    if isinstance(extras_df, pd.DataFrame) and not extras_df.empty:
-        monthly_series = pd.Series(dtype="float64")
-        per_piece_series = pd.Series(dtype="float64")
+    extras_monthly_total = float(
+        extras_df.loc[extras_df["Type"] == "Monthly", "Amount"].sum()
+    ) if isinstance(extras_df, pd.DataFrame) and not extras_df.empty else 0.0
 
-        raw_monthly = pd.to_numeric(
-            extras_df.loc[extras_df["Type"] == "Monthly", "Amount"],
-            errors="coerce"
-        )
-        raw_per_piece = pd.to_numeric(
-            extras_df.loc[extras_df["Type"] == "Per piece", "Amount"],
-            errors="coerce"
-        )
-
-        if isinstance(raw_monthly, pd.Series):
-            monthly_series = raw_monthly
-        elif raw_monthly is not None:
-            monthly_series = pd.Series(raw_monthly, dtype="float64")
-
-        if isinstance(raw_per_piece, pd.Series):
-            per_piece_series = raw_per_piece
-        elif raw_per_piece is not None:
-            per_piece_series = pd.Series(raw_per_piece, dtype="float64")
-
-        monthly_vals = monthly_series[pd.notna(monthly_series)]
-        per_piece_vals = per_piece_series[pd.notna(per_piece_series)]
-
-        extras_monthly_total = float(monthly_vals.fillna(0).sum()) if isinstance(monthly_vals, pd.Series) else 0.0
-        extras_per_piece_total = float(per_piece_vals.fillna(0).sum()) if isinstance(per_piece_vals, pd.Series) else 0.0
+    extras_per_piece_total = float(
+        extras_df.loc[extras_df["Type"] == "Per piece", "Amount"].sum()
+    ) if isinstance(extras_df, pd.DataFrame) and not extras_df.empty else 0.0
 
     st.caption(
         f"Custom adders totals → Monthly: {simbolo_base} {extras_monthly_total:.2f} | "
         f"Per piece: {simbolo_base} {extras_per_piece_total:.2f}"
     )
-
-    # ---------------------------------------------------------
-    # 7. Optional finishing: Heat Press
-    # ---------------------------------------------------------
-    st.markdown("---")
-    st.markdown("### 7. Finishing Option: Heat Press (Optional)")
-
-    press_enabled = st.checkbox(
-        "Include heat press finishing",
-        value=False,
-        help=(
-            "Enable this if the client will finish the garment using a heat press after DTG printing. "
-            "The app will add extra labor time, press energy and press depreciation to the unit cost."
-        )
-    )
-
-    press_use_same_labor = st.checkbox(
-        "Use same labor rate as printing",
-        value=True,
-        help=(
-            "When enabled, the heat press labor cost will use the same hourly rate calculated for the printing team. "
-            "Disable to use a dedicated heat press operator salary."
-        )
-    )
-
-    p1, p2, p3, p4, p5 = st.columns(5, gap="large")
-
-    with p1:
-        press_cycle_seconds = st.number_input(
-            "Press time per piece (seconds)",
-            min_value=0.0,
-            value=0.0,
-            step=1.0,
-            help="Average operator time to press one piece, in seconds. Used to calculate additional labor and energy for this finishing step."
-        )
-
-    with p2:
-        press_kw = st.number_input(
-            "Heat press power (kW)",
-            min_value=0.0,
-            value=1.8,
-            step=0.1,
-            help="Average power consumption of the heat press during operation."
-        )
-
-    with p3:
-        press_currency = st.selectbox(
-            "Heat press value currency",
-            ["USD", "BRL"],
-            index=0 if moeda_base == "USD" else 1,
-            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
-            help="Currency of the heat press acquisition value. It will be converted to the base currency."
-        )
-
-    with p4:
-        press_value_raw = st.number_input(
-            "Heat press value",
-            min_value=0.0,
-            value=2000.0,
-            step=100.0,
-            help="Approximate acquisition value of the heat press in the selected currency."
-        )
-
-    with p5:
-        press_operator_salary = st.number_input(
-            f"Press operator / month ({simbolo_base})",
-            min_value=0.0,
-            value=0.0,
-            step=100.0,
-            help=(
-                "Monthly base salary for a dedicated heat press operator. "
-                "Used only when 'Use same labor rate as printing' is disabled."
-            )
-        )
-
-    # Convert press value to base currency
-    if press_currency != moeda_base:
-        if dolar <= 0:
-            press_value = float(press_value_raw)
-            st.warning("Invalid USD/BRL rate. Heat press value will be used as entered.")
-        else:
-            if press_currency == "USD" and moeda_base == "BRL":
-                press_value = float(press_value_raw) * float(dolar)
-            elif press_currency == "BRL" and moeda_base == "USD":
-                press_value = float(press_value_raw) / float(dolar)
-            else:
-                press_value = float(press_value_raw)
-    else:
-        press_value = float(press_value_raw)
-
-    press_dep_months = st.number_input(
-        "Heat press depreciation (months)",
-        min_value=1,
-        value=36,
-        step=1,
-        help="Useful life in months for the heat press. Converted to an hourly and per-piece cost when enabled."
-    )
-
-    if press_enabled:
-        st.caption(
-            f"Heat press value in base currency: {simbolo_base} {press_value:,.0f}".replace(",", "")
-        )
-    if press_enabled and not press_use_same_labor:
-        st.caption("Dedicated press labor rate will be used for the heat press step.")
-        est_press_custo_hora = (
-            (float(press_operator_salary) * (1 + float(encargos)) / float(horas_mes))
-            if float(horas_mes) > 0 else 0.0
-        )
-        st.caption(f"Estimated dedicated press labor rate: {simbolo_base} {est_press_custo_hora:.2f}/h")
 
     # ---------------------------------------------------------
     # Order Data (horizontal, full-width)
@@ -1085,10 +863,6 @@ def main():
             consumo_file, erro_file = extrair_consumo_de_imagem(arquivo)
             if erro_file:
                 st.error(erro_file)
-                st.session_state["consumo_file"] = None
-                st.session_state["cpp_breakdown"] = None
-            elif consumo_file is None:
-                st.error("Could not extract consumption numbers from this file.")
                 st.session_state["consumo_file"] = None
                 st.session_state["cpp_breakdown"] = None
             else:
@@ -1232,15 +1006,6 @@ def main():
             extras_per_piece_total,
             service_allocation_method,
             expected_monthly_pcs,
-            press_enabled,
-            press_cycle_seconds,
-            press_kw,
-            press_value,
-            press_dep_months,
-            press_use_same_labor,
-            press_operator_salary,
-            sal_designer,
-            design_time_hours,
         )
         if isinstance(res, str):
             st.error(res)
@@ -1275,32 +1040,18 @@ def main():
             service_platform_pp = float(res.get("custo_service_platform_unit", 0.0))
 
             batch_size = st.selectbox(
-                "Batch size (summary only)",
+                "Batch size for summary",
                 [50, 100, 250, 500, 1000],
                 index=1,
                 key="batch_size_summary",
-                help=(
-                    "Reference lot size used only to display a quick commercial summary. "
-                    "This does NOT change unit cost, job time, charts, or the real order total."
-                )
+                help="Optional reference size to show cost per batch. Does not change the unit cost calculation."
             )
-            st.caption("For reporting only — unit cost remains unchanged.")
             cost_per_batch = float(res["custo_final_unit"]) * float(batch_size)
 
-            press_pp = float(res.get("custo_press_unit", 0.0))
-
-            jc1, jc2, jc3, jc4 = st.columns(4, gap="large")
+            jc1, jc2, jc3 = st.columns(3, gap="large")
             jc1.metric("Total job cost", f"{simbolo_base} {total_job_cost:,.2f}".replace(",", ""))
-            jc2.metric(f"Cost per reference batch ({batch_size} pcs)", f"{simbolo_base} {cost_per_batch:,.2f}".replace(",", ""))
+            jc2.metric(f"Cost per batch ({batch_size} pcs)", f"{simbolo_base} {cost_per_batch:,.2f}".replace(",", ""))
             jc3.metric("Service/Platform per piece", f"{simbolo_base} {service_platform_pp:.2f}")
-            jc4.metric("Heat press per piece", f"{simbolo_base} {press_pp:.2f}")
-
-            if press_enabled:
-                press_labor_rate_used = float(res.get("custo_hora_press", 0.0))
-                st.caption(f"Heat press enabled — {simbolo_base} {press_pp:.2f} per piece included in unit cost.")
-                st.caption(f"Heat press labor rate used: {simbolo_base} {press_labor_rate_used:.2f}/h")
-            else:
-                st.caption("Heat press not included in this quote.")
 
             st.markdown("")
 
@@ -1321,7 +1072,6 @@ def main():
                 ink_per_piece = float(res.get("ml_por_peca", 0.0))
                 fix_per_piece = float(res.get("ml_fixation", 0.0))
                 total_ink_job_ml = ink_per_piece * float(qtd)
-                total_ink_job_l = total_ink_job_ml / 1000.0
                 total_kwh_job = float(res.get("tempo_horas", 0.0)) * float(res.get("consumo_total_kw", 0.0))
 
                 r1a, r1b = st.columns(2, gap="large")
@@ -1344,7 +1094,7 @@ def main():
 
                 r4a, r4b = st.columns(2, gap="large")
                 with r4a:
-                    st.metric("Total ink / job", f"{total_ink_job_l:.2f} L")
+                    st.metric("Total ink / job", f"{total_ink_job_ml:.0f} ml")
                 with r4b:
                     st.metric("Energy / job", f"{total_kwh_job:.2f} kWh")
 
@@ -1355,8 +1105,6 @@ def main():
                 conservative_price = unit_cost * 1.20
                 standard_price = unit_cost * 1.30
                 aggressive_price = unit_cost * 1.50
-                if press_enabled and press_pp > 0:
-                    st.caption(f"Unit cost includes heat press: {simbolo_base} {press_pp:.2f} / piece")
 
                 lp1, lp2, lp3 = st.columns(3, gap="large")
 
@@ -1398,30 +1146,6 @@ def main():
                         st.caption("Labor / hour")
                         st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_equipe', 0.0)):.2f}**")
 
-                    if design_time_hours and float(design_time_hours) > 0:
-                        st.markdown("**Design assumptions**")
-                        d1, d2 = st.columns(2, gap="large")
-                        with d1:
-                            st.caption("Designer labor / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_designer', 0.0)):.2f}**")
-                        with d2:
-                            st.caption("Design effort / order")
-                            st.markdown(f"**{float(design_time_hours):.1f} h**")
-
-                    if press_enabled:
-                        st.markdown("**Heat press assumptions**")
-                        hp1, hp2, hp3 = st.columns(3, gap="large")
-                        with hp1:
-                            st.caption("Press labor / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_press', 0.0)):.2f}**")
-                        with hp2:
-                            st.caption("Press dep / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_press_dep_hour', 0.0)):.2f}**")
-                        with hp3:
-                            st.caption("Press energy / hour")
-                            press_energy_hour = float(press_kw) * float(kwh) if press_kw and kwh else 0.0
-                            st.markdown(f"**{simbolo_base} {press_energy_hour:.2f}**")
-
                     st.caption("Blank / piece")
                     st.markdown(f"**{simbolo_base} {float(tshirt_cost):.2f}**")
 
@@ -1429,8 +1153,8 @@ def main():
                 # ---------------------------------------------------------
                 # Pricing & Margin
                 # ---------------------------------------------------------
-                st.markdown("### Pricing Tools")
-                st.caption("Selling price suggestions and quick profit checks based on unit cost.")
+                st.markdown("### Pricing & Margin")
+                st.caption("Suggested selling prices based on target margins over unit cost.")
                 st.info(
                     "This section helps convert cost into a selling strategy.\n\n"
                     "• The pricing table uses markup over cost.\n"
@@ -1497,12 +1221,12 @@ def main():
 
             st.markdown("")
 
-            st.markdown("### Cost Breakdown Overview")
+            st.markdown("### Cost Overview")
             col_chart_a, col_chart_b = st.columns(2, gap="large")
 
             with col_chart_a:
-                st.markdown("#### Hourly Cost Drivers")
-                st.caption("How fixed monthly costs translate into hourly operational cost.")
+                st.markdown("#### Cost per hour (Operational)")
+                st.caption("Labor, energy and depreciation rates by hour.")
                 df_hora = pd.DataFrame([
                     {"Tipo": "Labor", "Valor": res["custo_hora_equipe"]},
                     {"Tipo": "Energy", "Valor": res["custo_hora_energia"]},
@@ -1537,22 +1261,20 @@ def main():
                 )
 
             with col_chart_b:
-                st.markdown("#### Unit Cost Composition")
-                st.caption("Per-piece cost breakdown including ink, blank, and allocated monthly fees.")
+                st.markdown("#### Cost per piece (Unit breakdown)")
+                st.caption("Unit cost composition including ink and blank.")
                 df_unit = pd.DataFrame([
                     {"Item": "Labor", "Custo": res["custo_mo_unit"]},
-                    {"Item": "Design", "Custo": res.get("custo_design_unit", 0.0)},
                     {"Item": "Ink", "Custo": res["custo_tinta_unit"]},
                     {"Item": "Energy", "Custo": res["custo_energia_unit"]},
                     {"Item": "Depreciation", "Custo": res["custo_dep_unit"]},
                     {"Item": "Service/Platform", "Custo": res.get("custo_service_platform_unit", 0.0)},
-                    {"Item": "Heat press", "Custo": res.get("custo_press_unit", 0.0)},
                     {"Item": "T-shirt", "Custo": res["custo_tshirt_unit"]},
                 ])
                 base_unit = alt.Chart(df_unit).encode(
                     x=alt.X(
                         "Item:N",
-                        sort=["Labor", "Design", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"],
+                        sort=["Labor", "Ink", "Energy", "Depreciation", "Service/Platform", "T-shirt"],
                         axis=alt.Axis(labelAngle=0, title=None),
                         scale=alt.Scale(padding=0.3),
                     ),
@@ -1584,12 +1306,10 @@ def main():
             st.caption("Percentual distribution:")
             total = res['custo_final_unit']
             st.progress(res['custo_mo_unit']/total, f"Labor: {simbolo_base} {res['custo_mo_unit']:.2f}")
-            st.progress(res.get('custo_design_unit', 0.0)/total, f"Design: {simbolo_base} {res.get('custo_design_unit', 0.0):.2f}")
             st.progress(res['custo_tinta_unit']/total, f"Ink: {simbolo_base} {res['custo_tinta_unit']:.2f}")
             st.progress(res['custo_energia_unit']/total, f"Energy: {simbolo_base} {res['custo_energia_unit']:.2f}")
             st.progress(res['custo_dep_unit']/total, f"Depreciation: {simbolo_base} {res['custo_dep_unit']:.2f}")
             st.progress(res.get('custo_service_platform_unit', 0.0)/total, f"Service/Platform: {simbolo_base} {res.get('custo_service_platform_unit', 0.0):.2f}")
-            st.progress(res.get('custo_press_unit', 0.0)/total, f"Heat press: {simbolo_base} {res.get('custo_press_unit', 0.0):.2f}")
             st.progress(res['custo_tshirt_unit']/total, f"T-shirt: {simbolo_base} {res['custo_tshirt_unit']:.2f}")
 
 if __name__ == "__main__":

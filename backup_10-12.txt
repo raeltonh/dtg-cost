@@ -13,6 +13,7 @@ FATORES_COMPLEXIDADE = {
     "Artistic (HD/Fine Art)": {"fator_velocidade": 0.5, "consumo_ml": 10.0}
 }
 
+
 def extrair_consumo_de_imagem(uploaded_file):
     try:
         from PIL import Image
@@ -351,9 +352,7 @@ def calcular_custo_total(
     press_value,
     press_dep_months,
     press_use_same_labor,
-    press_operator_salary,
-    designer_salary,
-    design_time_hours
+    press_operator_salary
 ):
     def converter_para_base(valor, moeda_valor):
         if moeda_valor == moeda_base: return valor
@@ -394,26 +393,6 @@ def calcular_custo_total(
     
     custo_total_mo = tempo_total_min * custo_minuto_equipe
     custo_unit_mo = custo_total_mo / qtd_pedido
-
-    # -------------------------------------------------
-    # Optional prepress/design labor (one-time per job)
-    # Allocated across the order quantity
-    # -------------------------------------------------
-    custo_hora_designer = 0.0
-    custo_design_total = 0.0
-    custo_design_unit = 0.0
-    designer_hours_job = 0.0
-
-    if design_time_hours and float(design_time_hours) > 0 and horas_mes > 0:
-        base_sal_designer = float(designer_salary) if designer_salary is not None else 0.0
-        if base_sal_designer > 0:
-            custo_hora_designer = (base_sal_designer * (1 + float(encargos))) / float(horas_mes)
-        else:
-            custo_hora_designer = 0.0
-
-        designer_hours_job = float(design_time_hours)
-        custo_design_total = designer_hours_job * float(custo_hora_designer)
-        custo_design_unit = (custo_design_total / float(qtd_pedido)) if qtd_pedido > 0 else 0.0
 
     if preco_tinta_ml_manual is not None:
         custo_tinta_ml_base = preco_tinta_ml_manual
@@ -506,11 +485,11 @@ def calcular_custo_total(
     )
 
     custo_unit_total = custo_unit_mo + custo_tinta_unit + custo_energia_unit
-    custo_unit_total += dep_unit + tshirt_unit + service_platform_unit + press_unit_total + custo_design_unit
+    custo_unit_total += dep_unit + tshirt_unit + service_platform_unit + press_unit_total
 
     return {
         "vel_real": vel_real, "tempo_horas": tempo_total_min / 60,
-        "custo_mo_unit": custo_unit_mo, "custo_design_unit": custo_design_unit, "custo_tinta_unit": custo_tinta_unit,
+        "custo_mo_unit": custo_unit_mo, "custo_tinta_unit": custo_tinta_unit,
         "custo_energia_unit": custo_energia_unit,
         "custo_dep_unit": dep_unit,
         "custo_tshirt_unit": tshirt_unit,
@@ -538,7 +517,6 @@ def calcular_custo_total(
         "preco_tinta_ml_base": custo_tinta_ml_base, "preco_tinta_litro_base": preco_litro_base,
         "horas_mes": horas_mes,
         "custo_hora_equipe": custo_hora_equipe,
-        "custo_hora_designer": custo_hora_designer,
         "custo_hora_press": press_custo_hora,
         "custo_hora_energia": custo_hora_energia,
         "custo_dep_hour": dep_hour,
@@ -644,22 +622,6 @@ def main():
             f"Assistant ({simbolo_base})",
             value=2500.0,
             help="Monthly base salary for the assistant/second operator."
-        )
-        sal_designer = st.number_input(
-            f"Designer ({simbolo_base})",
-            value=0.0,
-            step=100.0,
-            help="Monthly base salary for the designer/prepress resource (optional)."
-        )
-
-        design_time_hours = st.number_input(
-            "Estimated design effort for this order (hours)",
-            value=0.0,
-            step=0.5,
-            help=(
-                "Total design/prepress effort for this order (in hours, not per-piece). "
-                "The value is allocated across the order quantity and added to the unit cost."
-            )
         )
         encargos = st.number_input(
             "Labor burden / overhead (%)",
@@ -859,36 +821,13 @@ def main():
         },
     )
 
-    extras_monthly_total = 0.0
-    extras_per_piece_total = 0.0
-    if isinstance(extras_df, pd.DataFrame) and not extras_df.empty:
-        monthly_series = pd.Series(dtype="float64")
-        per_piece_series = pd.Series(dtype="float64")
+    extras_monthly_total = float(
+        extras_df.loc[extras_df["Type"] == "Monthly", "Amount"].sum()
+    ) if isinstance(extras_df, pd.DataFrame) and not extras_df.empty else 0.0
 
-        raw_monthly = pd.to_numeric(
-            extras_df.loc[extras_df["Type"] == "Monthly", "Amount"],
-            errors="coerce"
-        )
-        raw_per_piece = pd.to_numeric(
-            extras_df.loc[extras_df["Type"] == "Per piece", "Amount"],
-            errors="coerce"
-        )
-
-        if isinstance(raw_monthly, pd.Series):
-            monthly_series = raw_monthly
-        elif raw_monthly is not None:
-            monthly_series = pd.Series(raw_monthly, dtype="float64")
-
-        if isinstance(raw_per_piece, pd.Series):
-            per_piece_series = raw_per_piece
-        elif raw_per_piece is not None:
-            per_piece_series = pd.Series(raw_per_piece, dtype="float64")
-
-        monthly_vals = monthly_series[pd.notna(monthly_series)]
-        per_piece_vals = per_piece_series[pd.notna(per_piece_series)]
-
-        extras_monthly_total = float(monthly_vals.fillna(0).sum()) if isinstance(monthly_vals, pd.Series) else 0.0
-        extras_per_piece_total = float(per_piece_vals.fillna(0).sum()) if isinstance(per_piece_vals, pd.Series) else 0.0
+    extras_per_piece_total = float(
+        extras_df.loc[extras_df["Type"] == "Per piece", "Amount"].sum()
+    ) if isinstance(extras_df, pd.DataFrame) and not extras_df.empty else 0.0
 
     st.caption(
         f"Custom adders totals → Monthly: {simbolo_base} {extras_monthly_total:.2f} | "
@@ -998,11 +937,6 @@ def main():
         )
     if press_enabled and not press_use_same_labor:
         st.caption("Dedicated press labor rate will be used for the heat press step.")
-        est_press_custo_hora = (
-            (float(press_operator_salary) * (1 + float(encargos)) / float(horas_mes))
-            if float(horas_mes) > 0 else 0.0
-        )
-        st.caption(f"Estimated dedicated press labor rate: {simbolo_base} {est_press_custo_hora:.2f}/h")
 
     # ---------------------------------------------------------
     # Order Data (horizontal, full-width)
@@ -1085,10 +1019,6 @@ def main():
             consumo_file, erro_file = extrair_consumo_de_imagem(arquivo)
             if erro_file:
                 st.error(erro_file)
-                st.session_state["consumo_file"] = None
-                st.session_state["cpp_breakdown"] = None
-            elif consumo_file is None:
-                st.error("Could not extract consumption numbers from this file.")
                 st.session_state["consumo_file"] = None
                 st.session_state["cpp_breakdown"] = None
             else:
@@ -1239,8 +1169,6 @@ def main():
             press_dep_months,
             press_use_same_labor,
             press_operator_salary,
-            sal_designer,
-            design_time_hours,
         )
         if isinstance(res, str):
             st.error(res)
@@ -1296,9 +1224,7 @@ def main():
             jc4.metric("Heat press per piece", f"{simbolo_base} {press_pp:.2f}")
 
             if press_enabled:
-                press_labor_rate_used = float(res.get("custo_hora_press", 0.0))
                 st.caption(f"Heat press enabled — {simbolo_base} {press_pp:.2f} per piece included in unit cost.")
-                st.caption(f"Heat press labor rate used: {simbolo_base} {press_labor_rate_used:.2f}/h")
             else:
                 st.caption("Heat press not included in this quote.")
 
@@ -1397,30 +1323,6 @@ def main():
                     with a4:
                         st.caption("Labor / hour")
                         st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_equipe', 0.0)):.2f}**")
-
-                    if design_time_hours and float(design_time_hours) > 0:
-                        st.markdown("**Design assumptions**")
-                        d1, d2 = st.columns(2, gap="large")
-                        with d1:
-                            st.caption("Designer labor / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_designer', 0.0)):.2f}**")
-                        with d2:
-                            st.caption("Design effort / order")
-                            st.markdown(f"**{float(design_time_hours):.1f} h**")
-
-                    if press_enabled:
-                        st.markdown("**Heat press assumptions**")
-                        hp1, hp2, hp3 = st.columns(3, gap="large")
-                        with hp1:
-                            st.caption("Press labor / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_press', 0.0)):.2f}**")
-                        with hp2:
-                            st.caption("Press dep / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_press_dep_hour', 0.0)):.2f}**")
-                        with hp3:
-                            st.caption("Press energy / hour")
-                            press_energy_hour = float(press_kw) * float(kwh) if press_kw and kwh else 0.0
-                            st.markdown(f"**{simbolo_base} {press_energy_hour:.2f}**")
 
                     st.caption("Blank / piece")
                     st.markdown(f"**{simbolo_base} {float(tshirt_cost):.2f}**")
@@ -1541,7 +1443,6 @@ def main():
                 st.caption("Per-piece cost breakdown including ink, blank, and allocated monthly fees.")
                 df_unit = pd.DataFrame([
                     {"Item": "Labor", "Custo": res["custo_mo_unit"]},
-                    {"Item": "Design", "Custo": res.get("custo_design_unit", 0.0)},
                     {"Item": "Ink", "Custo": res["custo_tinta_unit"]},
                     {"Item": "Energy", "Custo": res["custo_energia_unit"]},
                     {"Item": "Depreciation", "Custo": res["custo_dep_unit"]},
@@ -1552,7 +1453,7 @@ def main():
                 base_unit = alt.Chart(df_unit).encode(
                     x=alt.X(
                         "Item:N",
-                        sort=["Labor", "Design", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"],
+                        sort=["Labor", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"],
                         axis=alt.Axis(labelAngle=0, title=None),
                         scale=alt.Scale(padding=0.3),
                     ),
@@ -1584,7 +1485,6 @@ def main():
             st.caption("Percentual distribution:")
             total = res['custo_final_unit']
             st.progress(res['custo_mo_unit']/total, f"Labor: {simbolo_base} {res['custo_mo_unit']:.2f}")
-            st.progress(res.get('custo_design_unit', 0.0)/total, f"Design: {simbolo_base} {res.get('custo_design_unit', 0.0):.2f}")
             st.progress(res['custo_tinta_unit']/total, f"Ink: {simbolo_base} {res['custo_tinta_unit']:.2f}")
             st.progress(res['custo_energia_unit']/total, f"Energy: {simbolo_base} {res['custo_energia_unit']:.2f}")
             st.progress(res['custo_dep_unit']/total, f"Depreciation: {simbolo_base} {res['custo_dep_unit']:.2f}")
