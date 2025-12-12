@@ -1,9 +1,24 @@
 import re
+from pathlib import Path
 import streamlit as st
 import altair as alt
 import pandas as pd
 from PIL import Image
 import pytesseract
+
+# --- BRANDING / LOGO ---
+BASE_DIR = Path(__file__).resolve().parent
+LOGO_PATH = BASE_DIR / "assets" / "logo.png"
+LOGO_WIDTH = 160  # adjust logo size here
+
+def render_top_header(title_text: str) -> None:
+    """Top header with title (left) and logo (right)."""
+    col_left, col_right = st.columns([0.78, 0.22], vertical_alignment="center")
+    with col_left:
+        st.title(title_text)
+    with col_right:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=LOGO_WIDTH)
 
 # --- CONFIGURAÇÕES E DADOS PADRÃO ---
 FATORES_COMPLEXIDADE = {
@@ -559,7 +574,7 @@ def main():
     if "consumo_file" not in st.session_state:
         st.session_state["consumo_file"] = None
     
-    st.title("👕 DTG Cost Calculator")
+    render_top_header("👕 DTG Cost Calculator")
     st.markdown("---")
 
     st.markdown("### General Inputs")
