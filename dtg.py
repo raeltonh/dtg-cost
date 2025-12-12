@@ -288,7 +288,7 @@ def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: 
             (chart_totais + text_totais)
             .configure_view(stroke=None)
             .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4),
-            use_container_width=True
+            width="stretch"
         )
 
     with col_chart2:
@@ -314,7 +314,7 @@ def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: 
             .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
         )
 
-        st.altair_chart(chart_canais, use_container_width=True)
+        st.altair_chart(chart_canais, width="stretch")
 
 def calcular_custo_total(
     qtd_pedido,
@@ -836,7 +836,7 @@ def main():
     extras_df = st.data_editor(
         extras_df_default,
         num_rows="dynamic",
-        use_container_width=True,
+        width="stretch",
         key="extras_cost_adders",
         column_config={
             "Description": st.column_config.TextColumn(
@@ -1109,14 +1109,14 @@ def main():
                         with t1:
                             st.dataframe(
                                 pd.DataFrame(dm)[["campo", "valor"]],
-                                use_container_width=True,
+                                width="stretch",
                                 height=260
                             )
                     if cc:
                         with t2:
                             st.dataframe(
                                 pd.DataFrame(cc)[["canal", "valor"]],
-                                use_container_width=True,
+                                width="stretch",
                                 height=260
                             )
 
@@ -1457,7 +1457,7 @@ def main():
                         })
 
                     df_pricing = pd.DataFrame(rows)
-                    st.dataframe(df_pricing, use_container_width=True, height=220)
+                    st.dataframe(df_pricing, width="stretch", height=220)
 
                 with pm_right:
                     st.caption("Quick calculator")
@@ -1533,7 +1533,7 @@ def main():
                     .properties(height=360)
                     .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.6)
                     .configure_view(stroke=None),
-                    use_container_width=True
+                    width="stretch"
                 )
 
             with col_chart_b:
@@ -1574,7 +1574,7 @@ def main():
                     .properties(height=360)
                     .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.6)
                     .configure_view(stroke=None),
-                    use_container_width=True
+                    width="stretch"
                 )
 
             # Progress bars
