@@ -562,8 +562,117 @@ def calcular_custo_total(
         "custo_energia_kwh": custo_energia_kwh
     }
 
-def main():
-    st.set_page_config(page_title="Calculadora DTG Pro", page_icon="👕", layout="wide")
+
+def render_roi_tab():
+    st.markdown("### ROI / Payback")
+    last_calc = st.session_state.get("last_calc")
+
+    if not last_calc:
+        st.info("Run a cost calculation in the Cost tab first.")
+        return
+
+    result = last_calc.get("result") or {}
+    unit_cost = float(last_calc.get("unit_cost") or result.get("custo_final_unit") or 0.0)
+    simbolo_base = last_calc.get("currency_symbol", "US$")
+    moeda_base = last_calc.get("base_currency", "USD")
+
+    st.caption(
+        f"Base currency: {moeda_base} | Using the last calculated unit cost from the Cost tab."
+    )
+
+    default_price = unit_cost * 1.30 if unit_cost > 0 else 0.0
+    default_volume = int(last_calc.get("order_qty") or 1000)
+    default_investment = float(last_calc.get("machine_value") or 0.0)
+    if last_calc.get("press_enabled"):
+        default_investment += float(last_calc.get("press_value") or 0.0)
+
+    c1, c2, c3 = st.columns(3, gap="large")
+    with c1:
+        selling_price = st.number_input(
+            f"Selling price per piece ({simbolo_base})",
+            min_value=0.0,
+            value=float(default_price),
+            step=0.10,
+            help="Planned selling price. Used to calculate margin and ROI."
+        )
+        unit_margin = selling_price - unit_cost
+        margin_pct = (unit_margin / unit_cost * 100) if unit_cost > 0 else 0.0
+        st.metric("Unit margin", f"{simbolo_base} {unit_margin:.2f}", f"{margin_pct:.1f}% over cost")
+
+    with c2:
+        monthly_volume = st.number_input(
+            "Expected monthly volume (pcs)",
+            min_value=1,
+            value=default_volume,
+            step=100,
+            help="Expected sales volume per month used for payback and ROI."
+        )
+        st.metric("Monthly revenue", f"{simbolo_base} {selling_price * monthly_volume:,.2f}".replace(",", ""))
+
+    with c3:
+        upfront_investment = st.number_input(
+            f"Total upfront investment ({simbolo_base})",
+            min_value=0.0,
+            value=float(default_investment),
+            step=1000.0,
+            help="Sum of equipment and other upfront costs you want to recover."
+        )
+        monthly_extra = st.number_input(
+            f"Extra monthly fixed costs ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=50.0,
+            help="Optional: costs not embedded in the unit cost that should be discounted from monthly profit."
+        )
+
+    profit_monthly = (unit_margin * monthly_volume) - monthly_extra
+    payback_months = (upfront_investment / profit_monthly) if profit_monthly > 0 else None
+    annual_roi_pct = (
+        (profit_monthly * 12 / upfront_investment) * 100
+        if upfront_investment > 0 and profit_monthly > 0 else 0.0
+    )
+    pieces_to_payback = (upfront_investment / unit_margin) if unit_margin > 0 else None
+    breakeven_volume = (monthly_extra / unit_margin) if unit_margin > 0 else None
+
+    st.markdown("---")
+
+    m1, m2, m3, m4 = st.columns(4, gap="large")
+    m1.metric("Unit cost (last run)", f"{simbolo_base} {unit_cost:.2f}")
+    m2.metric("Monthly profit", f"{simbolo_base} {profit_monthly:,.2f}".replace(",", ""))
+    m3.metric("Annual ROI", f"{annual_roi_pct:.1f}%")
+
+    if payback_months:
+        m4.metric("Payback (months)", f"{payback_months:.1f} mo")
+    else:
+        m4.metric("Payback (months)", "—")
+
+    st.markdown("")
+
+    col_left, col_right = st.columns([1, 1], gap="large")
+
+    with col_left:
+        st.markdown("#### Breakeven and payback checkpoints")
+        if unit_margin <= 0:
+            st.error("Selling price is not above unit cost. Increase price or reduce cost to compute ROI.")
+        else:
+            st.write(
+                f"Pieces to recover the upfront investment: "
+                f"**{pieces_to_payback:.0f} pcs**" if pieces_to_payback else "Pieces to recover: —"
+            )
+            st.write(
+                f"Monthly volume to cover extra fixed costs: "
+                f"**{breakeven_volume:.0f} pcs/month**" if breakeven_volume else "Breakeven volume: —"
+            )
+            st.caption("Breakeven ignores upfront investment; payback pieces include it.")
+
+    with col_right:
+        st.markdown("#### Notes")
+        st.info(
+            "ROI uses the last unit cost calculated in the Cost tab. "
+            "Adjust selling price, monthly volume and upfront investment to test scenarios. "
+            "Extra monthly costs are subtracted before ROI is calculated."
+        )
+def render_cost_tab():
     # -----------------------------------------------------------------
     # Session state (keeps results visible when widgets change)
     # -----------------------------------------------------------------
@@ -573,9 +682,6 @@ def main():
         st.session_state["consumo_override"] = None
     if "consumo_file" not in st.session_state:
         st.session_state["consumo_file"] = None
-    
-    render_top_header("👕 DTG Cost Calculator")
-    st.markdown("---")
 
     st.markdown("### General Inputs")
     c_econ, c_insumo, c_team = st.columns(3, gap="large")
@@ -851,7 +957,6 @@ def main():
     extras_df = st.data_editor(
         extras_df_default,
         num_rows="dynamic",
-        width="stretch",
         key="extras_cost_adders",
         column_config={
             "Description": st.column_config.TextColumn(
@@ -1075,10 +1180,10 @@ def main():
         st.caption("Enter consumption per color (ml/piece).")
         c1, c2 = st.columns(2, gap="large")
         with c1:
-            cm = st.number_input("CMYK ml", 4.0, step=0.1, key="cm_manual_tab")
-            qf = st.number_input("Qfix ml", 0.5, step=0.1, key="qf_manual_tab")
+            cm = st.number_input("CMYK ml", min_value=0.0, value=4.0, step=0.1, key="cm_manual_tab")
+            qf = st.number_input("Qfix ml", min_value=0.0, value=0.5, step=0.1, key="qf_manual_tab")
         with c2:
-            wh = st.number_input("White ml", 1.5, step=0.1, key="wh_manual_tab")
+            wh = st.number_input("White ml", min_value=0.0, value=1.5, step=0.1, key="wh_manual_tab")
 
         consumo_manual = {"cmyk_ml": cm, "white_ml": wh, "qfix_ml": qf, "total_ml": cm + wh + qf}
 
@@ -1260,6 +1365,17 @@ def main():
         if isinstance(res, str):
             st.error(res)
             return
+        unit_cost = float(res["custo_final_unit"])
+        st.session_state["last_calc"] = {
+            "unit_cost": unit_cost,
+            "currency_symbol": simbolo_base,
+            "base_currency": moeda_base,
+            "order_qty": qtd,
+            "result": res,
+            "machine_value": machine_value,
+            "press_value": press_value,
+            "press_enabled": press_enabled,
+        }
 
         with col_result:
             st.subheader("📊 Financial Result")
@@ -1322,7 +1438,6 @@ def main():
             # ---------------------------------------------------------
             # Insights & Pricing (balanced layout)
             # ---------------------------------------------------------
-            unit_cost = float(res["custo_final_unit"])
 
             top_left, top_right = st.columns([1, 1], gap="large")
 
@@ -1593,8 +1708,6 @@ def main():
                 )
 
             # Progress bars
-
-            # Progress bars
             st.markdown("---")
             st.caption("Percentual distribution:")
             total = res['custo_final_unit']
@@ -1606,6 +1719,27 @@ def main():
             st.progress(res.get('custo_service_platform_unit', 0.0)/total, f"Service/Platform: {simbolo_base} {res.get('custo_service_platform_unit', 0.0):.2f}")
             st.progress(res.get('custo_press_unit', 0.0)/total, f"Heat press: {simbolo_base} {res.get('custo_press_unit', 0.0):.2f}")
             st.progress(res['custo_tshirt_unit']/total, f"T-shirt: {simbolo_base} {res['custo_tshirt_unit']:.2f}")
+
+
+def main():
+    st.set_page_config(page_title="Calculadora DTG Pro", page_icon="👕", layout="wide")
+    if "calc_mode" not in st.session_state:
+        st.session_state["calc_mode"] = None
+    if "consumo_override" not in st.session_state:
+        st.session_state["consumo_override"] = None
+    if "consumo_file" not in st.session_state:
+        st.session_state["consumo_file"] = None
+    if "last_calc" not in st.session_state:
+        st.session_state["last_calc"] = None
+
+    render_top_header("👕 DTG Cost Calculator")
+    st.markdown("---")
+
+    tab_cost, tab_roi = st.tabs(["Cost", "ROI"])
+    with tab_cost:
+        render_cost_tab()
+    with tab_roi:
+        render_roi_tab()
 
 if __name__ == "__main__":
     main()
