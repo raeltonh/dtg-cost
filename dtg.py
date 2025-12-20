@@ -4,7 +4,9 @@ import streamlit as st
 import altair as alt
 import pandas as pd
 from PIL import Image
-import pytesseract
+
+# Streamlit page config (must be the first Streamlit call)
+st.set_page_config(page_title="DTG Cost", layout="wide")
 
 # --- BRANDING / LOGO ---
 BASE_DIR = Path(__file__).resolve().parent
@@ -13,7 +15,7 @@ LOGO_WIDTH = 160  # adjust logo size here
 
 def render_top_header(title_text: str) -> None:
     """Top header with title (left) and logo (right)."""
-    col_left, col_right = st.columns([0.78, 0.22], vertical_alignment="center")
+    col_left, col_right = st.columns([0.78, 0.22])
     with col_left:
         st.title(title_text)
     with col_right:
@@ -69,131 +71,222 @@ def extrair_consumo_de_imagem(uploaded_file):
 
     def _to_float(num_str):
         if not num_str: return None
-        cleaned = num_str.replace(",", ".")
+        cleaned = str(num_str)
+        # Common OCR confusions
+        trans = str.maketrans({
+            "l": "1", "I": "1", "O": "0", "o": "0", "S": "5"
+        })
+        cleaned = cleaned.translate(trans)
+        cleaned = cleaned.replace(" ", "")
+        cleaned = cleaned.replace(",", ".")
         if not re.search(r"\d", cleaned): return None
-        try: return float(cleaned)
-        except ValueError: return None
+
+        # Handle OCR loss of decimal separators like "0389" -> 0.0389
+        if "." not in cleaned and cleaned.strip().startswith("0"):
+            digits = re.sub(r"\D", "", cleaned)
+            if digits:
+                try:
+                    return float(int(digits)) / (10 ** len(digits))
+                except Exception:
+                    pass
+
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
 
     def dedup_matches(matches):
+        """Deduplicate matches for both totals (campo/valor) and channels (canal/valor)."""
         seen = set()
         uniq = []
-        for m in matches:
-            key = (m.get("campo"), m.get("bruto"), m.get("valor"))
-            if key in seen: continue
+        for m in matches or []:
+            key_name = m.get("campo") if isinstance(m, dict) else None
+            if not key_name and isinstance(m, dict):
+                key_name = m.get("canal")
+            key = (key_name, m.get("bruto") if isinstance(m, dict) else None, m.get("valor") if isinstance(m, dict) else None)
+            if key in seen:
+                continue
             seen.add(key)
             uniq.append(m)
         return uniq
 
     def parse_totais(blob_text):
         debug_local = []
+
+        # Tolerante a OCR: Total pode virar TotaI/Tota1 e "=" pode virar "-" ou ":"
+        SEP = r"(?:=|:|\-|—|–)"
+        TOTAL_WORD = r"Tota[lI1]"  # Total / TotaI / Tota1
+
         def _pick_last(patterns, label):
             last_val = None
             for pat in patterns:
-                for m in re.finditer(pat, blob_text, flags=re.IGNORECASE):
+                for m in re.finditer(pat, blob_text, flags=re.IGNORECASE | re.MULTILINE):
                     val = _to_float(m.group(1))
-                    if val is not None: last_val = val
+                    if val is not None:
+                        last_val = val
             if last_val is not None:
                 debug_local.append({"campo": label, "valor": last_val})
             return last_val
 
         total_c = _pick_last(
             [
-                r"\bTotal\s*C\s*[:=]?\s*([\d\.,]+)",
-                r"\bTotalC\s*[:=]?\s*([\d\.,]+)",
-                r"\bTotal\s*Colors?\s*[:=]?\s*([\d\.,]+)",
-                r"\bTotal\s*CMYK\s*[:=]?\s*([\d\.,]+)",
-                r"\bCMYK\s*Total\s*[:=]?\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*C\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*Colors?\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*CMYK\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*CMYK\s*{TOTAL_WORD}\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*C\s*{SEP}\s*([\d\.,]+)",  # fallback sem depender do começo da linha
             ],
-            "Total C"
+            "Total C",
         )
+
         total_w = _pick_last(
             [
-                r"\bTotal\s*W\s*[:=]?\s*([\d\.,]+)",
-                r"\bTotalWhite\s*[:=]?\s*([\d\.,]+)",
-                r"\bTotal\s*White\s*[:=]?\s*([\d\.,]+)",
-                r"\bWhite\s*Total\s*[:=]?\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*W\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*White\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*White\s*{TOTAL_WORD}\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*W\s*{SEP}\s*([\d\.,]+)",
             ],
-            "Total W"
+            "Total W",
         )
+
         total_q = _pick_last(
             [
-                r"\bTotal\s*Q(?:fix)?\s*[:=]?\s*([\d\.,]+)",
-                r"\bQfix\s*[:=]?\s*([\d\.,]+)",
-                r"\bTotal\s*Q\s*[:=]?\s*([\d\.,]+)",
-                r"\bQ(?:c|w)?\s*Total\s*[:=]?\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*Q(?:fix)?\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*Qfix\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*Q\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*Q(?:fix)?\s*{SEP}\s*([\d\.,]+)",
             ],
-            "Total Q"
+            "Total Q",
         )
-        total_all = _pick_last([r"\bTotal\s*[:=]?\s*([\d\.,]+)"], "Total (geral)")
+
+        total_all = _pick_last(
+            [
+                rf"(?im)^\s*{TOTAL_WORD}\s*(?![A-Za-z])\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*(?![A-Za-z])\s*{SEP}\s*([\d\.,]+)",
+            ],
+            "Total (geral)",
+        )
 
         uniq_debug = []
         seen = set()
         for d in debug_local:
-            if d["campo"] in seen: continue
+            if d["campo"] in seen:
+                continue
             seen.add(d["campo"])
             uniq_debug.append(d)
+
         return total_c, total_w, total_q, total_all, uniq_debug
 
     def parse_canais(blob_text):
         resultado = []
+
+        SEP = r"(?:=|:|\-|—|–)"
+
         padroes = [
-            ("C", r"(?m)^\s*C\s*[=:]\s*([\d\.,]+)"), ("M", r"(?m)^\s*M\s*[=:]\s*([\d\.,]+)"),
-            ("Y", r"(?m)^\s*Y\s*[=:]\s*([\d\.,]+)"), ("K", r"(?m)^\s*K\s*[=:]\s*([\d\.,]+)"),
-            ("Ny", r"(?m)^\s*Ny\s*[=:]\s*([\d\.,]+)"), ("Np", r"(?m)^\s*Np\s*[=:]\s*([\d\.,]+)"),
-            ("Qc", r"(?m)^\s*Qc\s*[=:]\s*([\d\.,]+)"), ("Qw", r"(?m)^\s*Qw\s*[=:]\s*([\d\.,]+)"),
-            ("PE", r"(?m)^\s*PE\s*[=:]\s*([\d\.,]+)"), ("W", r"(?m)^\s*W\s*[=:]\s*([\d\.,]+)"),
-            ("PG", r"(?m)^\s*PG\s*[=:]\s*([\d\.,]+)"),
+            ("C",  rf"(?im)^\s*C\s*{SEP}\s*([\d\.,]+)"),
+            ("M",  rf"(?im)^\s*M\s*{SEP}\s*([\d\.,]+)"),
+            ("Y",  rf"(?im)^\s*Y\s*{SEP}\s*([\d\.,]+)"),
+            ("K",  rf"(?im)^\s*K\s*{SEP}\s*([\d\.,]+)"),
+            ("R",  rf"(?im)^\s*R\s*{SEP}\s*([\d\.,]+)"),  # NEW
+            ("G",  rf"(?im)^\s*G\s*{SEP}\s*([\d\.,]+)"),  # NEW
+            ("Np", rf"(?im)^\s*N\s*p\s*{SEP}\s*([\d\.,]+)"),
+            ("Ny", rf"(?im)^\s*N\s*y\s*{SEP}\s*([\d\.,]+)"),
+            ("Qc", rf"(?im)^\s*Q\s*c\s*{SEP}\s*([\d\.,]+)"),
+            ("PE", rf"(?im)^\s*P\s*E\s*{SEP}\s*([\d\.,]+)"),
+            ("W",  rf"(?im)^\s*W\s*{SEP}\s*([\d\.,]+)"),
+            ("Qw", rf"(?im)^\s*Q\s*w\s*{SEP}\s*([\d\.,]+)"),
+            ("PG", rf"(?im)^\s*P\s*G\s*{SEP}\s*([\d\.,]+)"),
         ]
+
         for canal, padrao in padroes:
             last_val = None
-            for m in re.finditer(padrao, blob_text, flags=re.IGNORECASE):
+            for m in re.finditer(padrao, blob_text, flags=re.IGNORECASE | re.MULTILINE):
                 val = _to_float(m.group(1))
-                if val is not None: last_val = val
-            if last_val is not None: resultado.append({"canal": canal, "valor": last_val})
+                if val is not None:
+                    last_val = val
+            if last_val is not None:
+                resultado.append({"canal": canal, "valor": last_val})
+
         return resultado
 
-    blob = " ".join(meta_textos)
+    blob = "\n".join(meta_textos)
     total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob)
     canais_consumo = parse_canais(blob)
 
+    # Fallback: if totals missing but we have channel values, derive totals
+    if not any([total_c, total_w, total_q, total_all]) and canais_consumo:
+        canal_map = {c["canal"]: float(c.get("valor", 0.0)) for c in canais_consumo if c.get("canal")}
+
+        # Sum CMYK-ish channels (includes K, Ny, Np if present)
+        c_comp = sum(canal_map.get(c, 0.0) for c in ["C", "M", "Y", "K", "R", "G", "Ny", "Np"])
+        w_comp = canal_map.get("W", 0.0)
+        q_comp = sum(canal_map.get(c, 0.0) for c in ["Qc", "Qw", "PE", "PG"])
+
+        if c_comp > 0 or w_comp > 0 or q_comp > 0:
+            total_c = c_comp
+            total_w = w_comp
+            total_q = q_comp
+            total_all = c_comp + w_comp + q_comp
+            debug_matches.append({"campo": "Derived totals", "valor": total_all, "bruto": "sum(channels)"})
+
     if not any([total_c, total_w, total_q, total_all]):
+        # OCR is optional; we import pytesseract lazily to avoid breaking app startup when it's not installed.
         try:
             import pytesseract
 
             # -----------------------------
-            # OCR preprocessing (robust)
+            # OCR preprocessing (focused on CPP left panel)
             # -----------------------------
             img_rgb = img.convert("RGB")
-
-            # Upscale for better OCR accuracy
-            scale = 2
             w, h = img_rgb.size
-            img_up = img_rgb.resize((w * scale, h * scale))
 
-            # Grayscale + simple threshold
-            img_gray = img_up.convert("L")
-            img_bin = img_gray.point(lambda x: 255 if x > 180 else 0)
+            # Crops: CPP values are on the left results panel
+            crops = [
+                img_rgb,
+                img_rgb.crop((0, int(h * 0.12), int(w * 0.36), int(h * 0.95))),  # left panel
+                img_rgb.crop((0, int(h * 0.55), int(w * 0.36), int(h * 0.98))),  # totals area (bottom left)
+            ]
 
-            # Two-pass OCR: binarized first, then grayscale as fallback
-            ocr_text_bin = pytesseract.image_to_string(img_bin, config="--psm 6")
-            ocr_text_gray = pytesseract.image_to_string(img_gray, config="--psm 6")
+            def _prep(im):
+                scale = 2
+                im_up = im.resize((im.size[0] * scale, im.size[1] * scale))
+                gray = im_up.convert("L")
+                bin_light = gray.point(lambda x: 255 if x > 185 else 0)
+                bin_dark = gray.point(lambda x: 255 if x > 160 else 0)
+                return gray, bin_light, bin_dark
 
-            ocr_text = (ocr_text_bin or "") + "\n" + (ocr_text_gray or "")
-            ocr_text = ocr_text.strip()
+            def _run_ocr(im):
+                texts = []
+                for psm in ("6", "11"):
+                    try:
+                        texts.append(pytesseract.image_to_string(im, config=f"--psm {psm}"))
+                    except Exception:
+                        pass
+                return "\n".join([t for t in texts if t])
+
+            ocr_texts = []
+            for cimg in crops:
+                gray, bin_light, bin_dark = _prep(cimg)
+                ocr_texts.append(_run_ocr(bin_light))
+                ocr_texts.append(_run_ocr(bin_dark))
+                ocr_texts.append(_run_ocr(gray))
+
+            ocr_text = "\n".join([t for t in ocr_texts if t]).strip()
 
             if ocr_text:
                 meta_textos.append(ocr_text)
 
-                blob_ocr = " ".join(meta_textos)
+                # IMPORTANT: keep newlines to help regex with ^ anchors
+                blob_ocr = "\n".join(meta_textos)
                 total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob_ocr)
                 canais_consumo = parse_canais(blob_ocr)
 
-                if debug_matches:
+                if debug_matches is not None:
                     debug_matches.append({"campo": "Fonte", "valor": 0, "bruto": "OCR"})
         except Exception:
             pass
 
-    if any([total_c, total_w, total_q]):
+    if any([total_c, total_w, total_q]):    
         total_ml = sum([v for v in [total_c, total_w, total_q] if v is not None])
         return {
             "cmyk_ml": total_c or 0.0, "white_ml": total_w or 0.0, "qfix_ml": total_q or 0.0,
@@ -303,7 +396,7 @@ def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: 
             (chart_totais + text_totais)
             .configure_view(stroke=None)
             .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4),
-            width="stretch"
+            use_container_width=True
         )
 
     with col_chart2:
@@ -329,7 +422,7 @@ def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: 
             .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
         )
 
-        st.altair_chart(chart_canais, width="stretch")
+        st.altair_chart(chart_canais, use_container_width=True)
 
 def calcular_custo_total(
     qtd_pedido,
@@ -368,7 +461,13 @@ def calcular_custo_total(
     press_use_same_labor,
     press_operator_salary,
     designer_salary,
-    design_time_hours
+    design_time_hours,
+    print_passes,
+    custom_print_time_min,
+    curing_model,
+    dryer_batch_size,
+    cure_time_min,
+    cure_handling_min
 ):
     def converter_para_base(valor, moeda_valor):
         if moeda_valor == moeda_base: return valor
@@ -404,8 +503,37 @@ def calcular_custo_total(
     vel_real = velocidade_nominal * eficiencia * fator_vel
     if vel_real == 0: return "Error: zero speed."
 
-    tempo_impressao_min = qtd_pedido / (vel_real / 60)
-    tempo_total_min = tempo_impressao_min + setup_min
+    import math
+
+    passes = max(1, int(print_passes)) if print_passes is not None else 1
+
+    # Printing time
+    # vel_real is treated as pcs/hour everywhere.
+    if custom_print_time_min and float(custom_print_time_min) > 0:
+        # Override = TOTAL print time across all passes (before setup), in minutes
+        tempo_impressao_min = float(custom_print_time_min)
+    else:
+        tempo_impressao_h = (float(qtd_pedido) / float(vel_real)) * float(passes)
+        tempo_impressao_min = float(tempo_impressao_h) * 60.0
+
+    # Safety guard: if something makes time unrealistically small, re-derive from qty/speed
+    if (not custom_print_time_min or float(custom_print_time_min) <= 0) and float(qtd_pedido) > 0 and float(vel_real) > 0:
+        min_expected_min = (float(qtd_pedido) / float(vel_real)) * float(passes) * 60.0
+        if float(tempo_impressao_min) < (0.90 * float(min_expected_min)):
+            tempo_impressao_min = float(min_expected_min)
+
+    # Curing time (minutes) — batch curing per pass
+    tempo_cura_min = 0.0
+    if curing_model == "batch_per_pass":
+        bs = int(dryer_batch_size) if dryer_batch_size and int(dryer_batch_size) > 0 else 1
+        ct = float(cure_time_min) if cure_time_min and float(cure_time_min) > 0 else 0.0
+        ch = float(cure_handling_min) if cure_handling_min and float(cure_handling_min) > 0 else 0.0
+
+        cycles_per_pass = int(math.ceil(float(qtd_pedido) / float(bs))) if qtd_pedido > 0 else 0
+        tempo_cura_min = float(passes) * float(cycles_per_pass) * float(ct + ch)
+
+    # Total job time
+    tempo_total_min = float(tempo_impressao_min) + float(setup_min) + float(tempo_cura_min)
     
     custo_total_mo = tempo_total_min * custo_minuto_equipe
     custo_unit_mo = custo_total_mo / qtd_pedido
@@ -439,12 +567,35 @@ def calcular_custo_total(
         custo_tinta_ml_base = preco_litro_base / 1000
     custo_tinta_unit = consumo_ml_total * custo_tinta_ml_base
     
-    consumo_total_kw = consumo_maquina_kw + consumo_forno_kw
-    horas_job = tempo_total_min / 60
-    total_kwh_job = horas_job * consumo_total_kw
-    custo_energia_total = total_kwh_job * custo_energia_kwh
-    custo_energia_unit = custo_energia_total / qtd_pedido
-    custo_hora_energia = consumo_total_kw * custo_energia_kwh
+    # -------------------------------------------------
+    # Energy model
+    # - legacy: printer + dryer run across the whole job time
+    # - batch_per_pass: printer energy only during printing; dryer energy only during curing
+    # -------------------------------------------------
+
+    horas_job = float(tempo_total_min) / 60.0
+    printer_hours_job = float(tempo_impressao_min) / 60.0
+    dryer_hours_job = float(tempo_cura_min) / 60.0
+
+    if curing_model == "batch_per_pass":
+        kwh_printer_job = printer_hours_job * float(consumo_maquina_kw)
+        kwh_dryer_job = dryer_hours_job * float(consumo_forno_kw)
+        total_kwh_job = kwh_printer_job + kwh_dryer_job
+    else:
+        # Legacy behavior
+        consumo_total_kw = float(consumo_maquina_kw) + float(consumo_forno_kw)
+        kwh_printer_job = horas_job * float(consumo_maquina_kw)
+        kwh_dryer_job = horas_job * float(consumo_forno_kw)
+        total_kwh_job = horas_job * float(consumo_total_kw)
+
+    custo_energia_total = float(total_kwh_job) * float(custo_energia_kwh)
+    custo_energia_unit = (custo_energia_total / float(qtd_pedido)) if qtd_pedido > 0 else 0.0
+
+    # Effective cost per hour (reflects curing model)
+    custo_hora_energia = (custo_energia_total / horas_job) if horas_job > 0 else 0.0
+
+    # Keep a combined kW field for UI summaries
+    consumo_total_kw = float(consumo_maquina_kw) + float(consumo_forno_kw)
 
     # Depreciation (hour and unit) - main printer
     dep_hour = machine_value / dep_months / horas_mes if dep_months > 0 and horas_mes > 0 else 0.0
@@ -559,7 +710,18 @@ def calcular_custo_total(
         "custo_dep_hour": dep_hour,
         "custo_service_platform_hour": (service_hour + platform_hour + extras_hour),
         "consumo_total_kw": consumo_total_kw,
-        "custo_energia_kwh": custo_energia_kwh
+        "custo_energia_kwh": custo_energia_kwh,
+        "tempo_setup_min": float(setup_min),
+        "tempo_cura_min": float(tempo_cura_min),
+        "tempo_total_min": float(tempo_total_min),
+        "printer_hours_job": float(printer_hours_job),
+        "dryer_hours_job": float(dryer_hours_job),
+        "kwh_printer_job": float(kwh_printer_job),
+        "kwh_dryer_job": float(kwh_dryer_job),
+        "kwh_total_job": float(total_kwh_job),
+        "custo_energia_total": float(custo_energia_total),
+        "passes": passes,
+        "tempo_impressao_min": tempo_impressao_min
     }
 
 
@@ -672,6 +834,68 @@ def render_roi_tab():
             "Adjust selling price, monthly volume and upfront investment to test scenarios. "
             "Extra monthly costs are subtracted before ROI is calculated."
         )
+#
+# ---------------------------------------------------------
+# Helpers: Unit cost breakdown rendering (robust + readable)
+# ---------------------------------------------------------
+
+def _safe_float(v, default: float = 0.0) -> float:
+    try:
+        if v is None:
+            return float(default)
+        return float(v)
+    except Exception:
+        return float(default)
+
+
+def _fmt_money(symbol: str, value: float) -> str:
+    v = _safe_float(value)
+    if abs(v) < 0.0005:
+        return f"{symbol} 0.00"
+    if abs(v) < 0.01:
+        return f"{symbol} {v:.4f}"
+    return f"{symbol} {v:.2f}"
+
+
+
+def _build_unit_breakdown_df(res: dict) -> pd.DataFrame:
+    rows = [
+        {"Item": "Labor", "Cost": _safe_float(res.get("custo_mo_unit", 0.0))},
+        {"Item": "Design", "Cost": _safe_float(res.get("custo_design_unit", 0.0))},
+        {"Item": "Ink", "Cost": _safe_float(res.get("custo_tinta_unit", 0.0))},
+        {"Item": "Energy", "Cost": _safe_float(res.get("custo_energia_unit", 0.0))},
+        {"Item": "Depreciation", "Cost": _safe_float(res.get("custo_dep_unit", 0.0))},
+        {"Item": "Service/Platform", "Cost": _safe_float(res.get("custo_service_platform_unit", 0.0))},
+        {"Item": "Heat press", "Cost": _safe_float(res.get("custo_press_unit", 0.0))},
+        {"Item": "T-shirt", "Cost": _safe_float(res.get("custo_tshirt_unit", 0.0))},
+    ]
+    df = pd.DataFrame(rows)
+    df["Cost"] = df["Cost"].clip(lower=0.0)
+    df = df.sort_values("Cost", ascending=False).reset_index(drop=True)
+    return df
+
+
+# Helper: Render unit cost distribution (percentual) block
+def render_unit_cost_distribution(res: dict, simbolo_base: str) -> None:
+    """Render a robust unit cost distribution block (never silently shows zeros)."""
+    st.markdown("### Percentual distribution")
+
+    df_break = _build_unit_breakdown_df(res)
+    total = float(df_break["Cost"].sum()) if not df_break.empty else 0.0
+
+    if total <= 0:
+        st.warning("No cost components were computed yet (total = 0).")
+        return
+
+    for _, row in df_break.iterrows():
+        item = str(row.get("Item", ""))
+        cost = _safe_float(row.get("Cost", 0.0))
+        pct = (cost / total) if total > 0 else 0.0
+
+        st.write(f"{item}: {_fmt_money(simbolo_base, cost)}")
+        st.progress(min(max(pct, 0.0), 1.0))
+
+
 def render_cost_tab():
     # -----------------------------------------------------------------
     # Session state (keeps results visible when widgets change)
@@ -1194,60 +1418,81 @@ def render_cost_tab():
 
     with tab_a:
         st.caption("Upload the PNG/TIFF exported from CPP Tool (Total C/W/Q).")
-        arquivo = st.file_uploader(
-            "File",
-            ["png", "tif", "tiff"],
+        arquivos = st.file_uploader(
+            "File(s)",
+            ["png", "tif", "tiff", "jpg", "jpeg"],
+            accept_multiple_files=True,
             key="up_cpp_tab2",
-            help="Upload a CPP summary image or export containing Total C / Total W / Total Q values."
+            help="Upload one or more CPP summaries (front/back/label). Values are summed."
         )
 
-        if arquivo:
-            consumo_file, erro_file = extrair_consumo_de_imagem(arquivo)
-            if erro_file:
-                st.error(erro_file)
-                st.session_state["consumo_file"] = None
-                st.session_state["cpp_breakdown"] = None
-            elif consumo_file is None:
-                st.error("Could not extract consumption numbers from this file.")
+        if arquivos:
+            consumos = []
+            erros = []
+            canais_sum = {}
+            file_rows = []
+
+            for arq in arquivos:
+                consumo_file, erro_file = extrair_consumo_de_imagem(arq)
+                if erro_file or consumo_file is None:
+                    erros.append(f"{arq.name}: {erro_file or 'No totals found'}")
+                    continue
+
+                consumos.append((arq.name, consumo_file))
+                file_rows.append({
+                    "File": arq.name,
+                    "CMYK (ml)": consumo_file["cmyk_ml"],
+                    "White (ml)": consumo_file["white_ml"],
+                    "Qfix (ml)": consumo_file["qfix_ml"],
+                    "Total (ml/piece)": consumo_file["total_ml"],
+                })
+
+                for canal in consumo_file.get("canais_consumo", []):
+                    canal_nome = canal.get("canal")
+                    valor = float(canal.get("valor", 0.0))
+                    if canal_nome:
+                        canais_sum[canal_nome] = canais_sum.get(canal_nome, 0.0) + valor
+
+            if not consumos:
+                st.error("Could not extract totals from the uploaded files. " + (" | ".join(erros) if erros else ""))
                 st.session_state["consumo_file"] = None
                 st.session_state["cpp_breakdown"] = None
             else:
+                total_c = sum(c["cmyk_ml"] for _, c in consumos)
+                total_w = sum(c["white_ml"] for _, c in consumos)
+                total_q = sum(c["qfix_ml"] for _, c in consumos)
+                total_all = sum(c["total_ml"] for _, c in consumos)
+
                 st.success(
-                    f"Extracted: CMYK={consumo_file['cmyk_ml']:.2f} ml, "
-                    f"White={consumo_file['white_ml']:.2f} ml, "
-                    f"Qfix={consumo_file['qfix_ml']:.2f} ml "
-                    f"(Total {consumo_file['total_ml']:.2f} ml/piece)."
+                    f"Summed {len(consumos)} file(s): CMYK={total_c:.2f} ml, "
+                    f"White={total_w:.2f} ml, Qfix={total_q:.2f} ml "
+                    f"(Total {total_all:.2f} ml/piece)."
                 )
-                st.session_state["consumo_file"] = consumo_file
+                if erros:
+                    st.warning("Some files were skipped: " + " | ".join(erros))
 
-                dm = consumo_file.get("debug_matches", [])
-                cc = consumo_file.get("canais_consumo", [])
+                if file_rows:
+                    st.dataframe(pd.DataFrame(file_rows), use_container_width=True, height=220)
 
-                with st.expander("Technical details (CPP)", expanded=False):
-                    t1, t2 = st.columns(2, gap="large")
-                    if dm:
-                        with t1:
-                            st.dataframe(
-                                pd.DataFrame(dm)[["campo", "valor"]],
-                                width="stretch",
-                                height=260
-                            )
-                    if cc:
-                        with t2:
-                            st.dataframe(
-                                pd.DataFrame(cc)[["canal", "valor"]],
-                                width="stretch",
-                                height=260
-                            )
+                consumo_file_agg = {
+                    "cmyk_ml": total_c,
+                    "white_ml": total_w,
+                    "qfix_ml": total_q,
+                    "total_ml": total_all,
+                    "canais_consumo": [{"canal": k, "valor": v} for k, v in canais_sum.items()],
+                    "debug_matches": [],
+                }
+                st.session_state["consumo_file"] = consumo_file_agg
 
                 color_map = {
                     "C": "#00bcd4", "M": "#d500f9", "Y": "#ffeb3b", "K": "#212121",
+                    "R": "#f44336", "G": "#4caf50",
                     "W": "#e0e0e0", "Qc": "#29b6f6", "Qw": "#81d4fa",
                     "Ny": "#ce93d8", "Np": "#bcaaa4", "PE": "#9575cd", "PG": "#66bb6a"
                 }
-                desired_order = ["C", "M", "Y", "K", "Ny", "Np", "Qc", "Qw", "PE", "W", "PG"]
+                desired_order = ["C", "M", "Y", "K", "R", "G", "Np", "Ny", "Qc", "PE", "W", "Qw", "PG"]
 
-                df_s = pd.DataFrame(cc)
+                df_s = pd.DataFrame(consumo_file_agg.get("canais_consumo", []))
                 present = set(df_s["canal"].tolist()) if not df_s.empty else set()
                 for canal in desired_order:
                     if canal not in present:
@@ -1259,11 +1504,6 @@ def render_cost_tab():
                 color_series = df_s["canal"].map(color_map).astype(object)
                 df_s["cor"] = color_series.where(color_series.notna(), "#9e9e9e")
 
-                total_c = consumo_file["cmyk_ml"]
-                total_w = consumo_file["white_ml"]
-                total_q = consumo_file["qfix_ml"]
-                total_all = consumo_file["total_ml"]
-
                 totals_df = pd.DataFrame([
                     {"campo": "Total C", "valor": total_c, "hex": "#64b5f6"},
                     {"campo": "Total W", "valor": total_w, "hex": "#1976d2"},
@@ -1272,7 +1512,7 @@ def render_cost_tab():
                 ])
 
                 st.session_state["cpp_breakdown"] = {
-                    "consumo_file": consumo_file,
+                    "consumo_file": consumo_file_agg,
                     "df_s": df_s,
                     "totals_df": totals_df,
                     "desired_order": desired_order,
@@ -1281,8 +1521,8 @@ def render_cost_tab():
                 st.info("Ink Breakdown will be displayed in the Results panel for a wider, cleaner view.")
 
         if st.button("Calculate (File)", type="primary", key="calc_a"):
-            if st.session_state.get("consumo_file") is None or erro_file:
-                st.error("Upload a valid file before calculating.")
+            if st.session_state.get("consumo_file") is None:
+                st.error("Upload at least one valid file before calculating.")
             else:
                 st.session_state["calc_mode"] = "arquivo"
                 st.session_state["consumo_override"] = st.session_state.get("consumo_file")
@@ -1307,6 +1547,77 @@ def render_cost_tab():
             "Setup (min)",
             value=15,
             help="Preparation time added once per job (loading, alignment, tests). Included in total job time."
+        )
+
+    mp1, mp2 = st.columns(2, gap="large")
+    with mp1:
+        print_passes = st.number_input(
+            "Print passes (front/back/label)",
+            min_value=1,
+            value=1,
+            step=1,
+            help="Use 1 for a single print, 2 for front+back, 3 for front+back+label, etc. Increases print time."
+        )
+    with mp2:
+        custom_print_time_min = st.number_input(
+            "Override total print time (min)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Optional: replace calculated print time with a measured total (before setup). Handy when you time multiple passes manually (e.g., 3 cycles × 23 min)."
+        )
+
+    st.markdown("#### Curing model (per pass)")
+
+    curing_model = st.selectbox(
+        "Curing time model",
+        options=["Legacy (included in job time)", "Batch curing per pass (front/back/label)"],
+        index=0,
+        help=(
+            "Legacy: keeps current behavior (dryer energy/time considered across the whole job time).\n"
+            "Batch curing per pass: adds curing time as batches for EACH print pass (front/back/label)."
+        ),
+    )
+
+    curing_model_key = "batch_per_pass" if curing_model.startswith("Batch") else "legacy"
+
+    dryer_batch_size = 10
+    cure_time_min = 23.0
+    cure_handling_min = 0.0
+
+    if curing_model_key == "batch_per_pass":
+        ccu1, ccu2, ccu3 = st.columns(3, gap="large")
+        with ccu1:
+            dryer_batch_size = st.number_input(
+                "Dryer batch capacity (pcs)",
+                min_value=1,
+                value=10,
+                step=1,
+                help="How many T-shirts fit in ONE curing cycle (batch).",
+            )
+        with ccu2:
+            cure_time_min = st.number_input(
+                "Cure time per batch (min)",
+                min_value=0.0,
+                value=23.0,
+                step=1.0,
+                help="Fixed curing time per batch (e.g., 23 minutes).",
+            )
+        with ccu3:
+            cure_handling_min = st.number_input(
+                "Load/Unload add-on per batch (min)",
+                min_value=0.0,
+                value=0.0,
+                step=0.5,
+                help="Optional handling time per batch (loading/unloading/rack handling).",
+            )
+
+        import math
+        cycles_preview = int(math.ceil(float(qtd) / float(dryer_batch_size))) if qtd and dryer_batch_size else 0
+        total_cure_preview = float(print_passes) * float(cycles_preview) * float(cure_time_min + cure_handling_min)
+        st.caption(
+            f"Preview: {cycles_preview} batch(es) per pass × {int(print_passes)} pass(es) → "
+            f"{total_cure_preview:.1f} min curing time added."
         )
 
     # Sync local variables with persisted state
@@ -1361,6 +1672,12 @@ def render_cost_tab():
             press_operator_salary,
             sal_designer,
             design_time_hours,
+            print_passes,
+            custom_print_time_min,
+            curing_model_key,
+            dryer_batch_size,
+            cure_time_min,
+            cure_handling_min,
         )
         if isinstance(res, str):
             st.error(res)
@@ -1396,8 +1713,20 @@ def render_cost_tab():
                     pass
             k1, k2, k3 = st.columns(3)
             k1.metric("Unit Cost", f"{simbolo_base} {res['custo_final_unit']:.2f}")
-            k2.metric("Total Time", f"{res['tempo_horas']:.1f} h")
+            total_h = float(res.get("tempo_horas", 0.0))
+            total_min = float(res.get("tempo_total_min", 0.0))
+            k2.metric("Total Time", f"{total_h:.1f} h", f"{total_min:.0f} min")
             k3.metric("Real Speed", f"{int(res['vel_real'])} pcs/h")
+
+            if curing_model_key == "batch_per_pass":
+                st.caption(
+                    f"Curing model: batch per pass | Curing time: {float(res.get('tempo_cura_min', 0.0)):.1f} min "
+                    f"(Printing: {float(res.get('tempo_impressao_min', 0.0)):.1f} min, Setup: {float(res.get('tempo_setup_min', 0.0)):.1f} min)"
+                )
+                st.caption(
+                    f"Energy split → Printer: {float(res.get('kwh_printer_job', 0.0)):.2f} kWh | "
+                    f"Dryer: {float(res.get('kwh_dryer_job', 0.0)):.2f} kWh"
+                )
 
             # ---------------------------------------------------------
             # Job Cost Summary
@@ -1436,6 +1765,25 @@ def render_cost_tab():
             st.markdown("")
 
             # ---------------------------------------------------------
+            # Cost breakdown: per piece vs total (job)
+            # ---------------------------------------------------------
+            st.markdown("### Cost Breakdown (per piece vs total)")
+            df_break = _build_unit_breakdown_df(res)
+            if isinstance(df_break, pd.DataFrame) and not df_break.empty:
+                df_job = df_break.copy()
+                df_job["Per piece"] = df_job["Cost"].astype(float)
+                df_job["Total (job)"] = df_job["Per piece"] * float(qtd)
+
+                # Friendly money-formatted columns
+                df_job["Per piece"] = df_job["Per piece"].apply(lambda v: _fmt_money(simbolo_base, float(v)))
+                df_job["Total (job)"] = df_job["Total (job)"].apply(lambda v: _fmt_money(simbolo_base, float(v)))
+
+                df_job = df_job[["Item", "Per piece", "Total (job)"]]
+                st.dataframe(df_job, use_container_width=True, height=300)
+            else:
+                st.info("No breakdown available yet. Run a calculation first.")
+
+            # ---------------------------------------------------------
             # Insights & Pricing (balanced layout)
             # ---------------------------------------------------------
 
@@ -1452,7 +1800,7 @@ def render_cost_tab():
                 fix_per_piece = float(res.get("ml_fixation", 0.0))
                 total_ink_job_ml = ink_per_piece * float(qtd)
                 total_ink_job_l = total_ink_job_ml / 1000.0
-                total_kwh_job = float(res.get("tempo_horas", 0.0)) * float(res.get("consumo_total_kw", 0.0))
+                total_kwh_job = float(res.get("kwh_total_job", 0.0))
 
                 r1a, r1b = st.columns(2, gap="large")
                 with r1a:
@@ -1587,7 +1935,7 @@ def render_cost_tab():
                         })
 
                     df_pricing = pd.DataFrame(rows)
-                    st.dataframe(df_pricing, width="stretch", height=220)
+                    st.dataframe(df_pricing, use_container_width=True, height=220)
 
                 with pm_right:
                     st.caption("Quick calculator")
@@ -1627,6 +1975,11 @@ def render_cost_tab():
 
             st.markdown("")
 
+            # ---------------------------------------------------------
+            # Percentual distribution (unit cost distribution)
+            # ---------------------------------------------------------
+            render_unit_cost_distribution(res, simbolo_base)
+
             st.markdown("### Cost Breakdown Overview")
             col_chart_a, col_chart_b = st.columns(2, gap="large")
 
@@ -1663,83 +2016,62 @@ def render_cost_tab():
                     .properties(height=360)
                     .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.6)
                     .configure_view(stroke=None),
-                    width="stretch"
+                    use_container_width=True
                 )
 
             with col_chart_b:
                 st.markdown("#### Unit Cost Composition")
                 st.caption("Per-piece cost breakdown including ink, blank, and allocated monthly fees.")
-                df_unit = pd.DataFrame([
-                    {"Item": "Labor", "Custo": res["custo_mo_unit"]},
-                    {"Item": "Design", "Custo": res.get("custo_design_unit", 0.0)},
-                    {"Item": "Ink", "Custo": res["custo_tinta_unit"]},
-                    {"Item": "Energy", "Custo": res["custo_energia_unit"]},
-                    {"Item": "Depreciation", "Custo": res["custo_dep_unit"]},
-                    {"Item": "Service/Platform", "Custo": res.get("custo_service_platform_unit", 0.0)},
-                    {"Item": "Heat press", "Custo": res.get("custo_press_unit", 0.0)},
-                    {"Item": "T-shirt", "Custo": res["custo_tshirt_unit"]},
-                ])
+
+                df_unit = _build_unit_breakdown_df(res)
+
                 base_unit = alt.Chart(df_unit).encode(
-                    x=alt.X(
-                        "Item:N",
-                        sort=["Labor", "Design", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"],
-                        axis=alt.Axis(labelAngle=0, title=None),
-                        scale=alt.Scale(padding=0.3),
-                    ),
-                    y=alt.Y("Custo:Q", title=f"Cost per piece ({simbolo_base})"),
-                    tooltip=["Item", alt.Tooltip("Custo", format=".2f")]
+                    x=alt.X("Cost:Q", title=f"Cost per piece ({simbolo_base})", axis=alt.Axis(format=".2f")),
+                    y=alt.Y("Item:N", sort="-x", title=None),
+                    tooltip=[alt.Tooltip("Item:N"), alt.Tooltip("Cost:Q", format=".4f")],
                 )
-                bars_unit = base_unit.mark_bar(cornerRadius=14, size=70).encode(
-                    color=alt.Color(
-                        "Item:N",
-                        scale=alt.Scale(scheme="orangered"),
-                        legend=None,
-                    )
+                bars_unit = base_unit.mark_bar(cornerRadius=12, size=26).encode(
+                    color=alt.Color("Item:N", legend=None, scale=alt.Scale(scheme="blues"))
                 )
-                text_unit = base_unit.mark_text(dy=-14, fontSize=16, fontWeight='bold').encode(
-                    text=alt.Text("Custo:Q", format=".2f")
-                )
+                labels_unit = base_unit.mark_text(align="left", dx=6).encode(text=alt.Text("Cost:Q", format=".4f"))
+
                 st.altair_chart(
-                    (bars_unit + text_unit)
-                    .properties(height=360)
+                    (bars_unit + labels_unit)
+                    .properties(height=max(260, 28 * len(df_unit)))
                     .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.6)
                     .configure_view(stroke=None),
-                    width="stretch"
+                    use_container_width=True,
                 )
 
-            # Progress bars
-            st.markdown("---")
-            st.caption("Percentual distribution:")
-            total = res['custo_final_unit']
-            st.progress(res['custo_mo_unit']/total, f"Labor: {simbolo_base} {res['custo_mo_unit']:.2f}")
-            st.progress(res.get('custo_design_unit', 0.0)/total, f"Design: {simbolo_base} {res.get('custo_design_unit', 0.0):.2f}")
-            st.progress(res['custo_tinta_unit']/total, f"Ink: {simbolo_base} {res['custo_tinta_unit']:.2f}")
-            st.progress(res['custo_energia_unit']/total, f"Energy: {simbolo_base} {res['custo_energia_unit']:.2f}")
-            st.progress(res['custo_dep_unit']/total, f"Depreciation: {simbolo_base} {res['custo_dep_unit']:.2f}")
-            st.progress(res.get('custo_service_platform_unit', 0.0)/total, f"Service/Platform: {simbolo_base} {res.get('custo_service_platform_unit', 0.0):.2f}")
-            st.progress(res.get('custo_press_unit', 0.0)/total, f"Heat press: {simbolo_base} {res.get('custo_press_unit', 0.0):.2f}")
-            st.progress(res['custo_tshirt_unit']/total, f"T-shirt: {simbolo_base} {res['custo_tshirt_unit']:.2f}")
+                st.markdown("")
+                st.markdown("**Percentual distribution:**")
 
+                unit_total = _safe_float(res.get("custo_final_unit", 0.0))
+                if unit_total <= 0:
+                    st.info("No unit total found to compute distribution.")
+                else:
+                    order_items = ["Labor", "Design", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"]
+                    df_show = df_unit.set_index("Item").reindex(order_items).reset_index()
+                    df_show["Cost"] = pd.to_numeric(df_show["Cost"], errors="coerce").fillna(0.0)
 
+                    for _, row in df_show.iterrows():
+                        item = str(row["Item"]) if row.get("Item") is not None else ""
+                        cost = _safe_float(row.get("Cost", 0.0))
+                        pct = (cost / unit_total) if unit_total > 0 else 0.0
+                        pct = max(0.0, min(1.0, float(pct)))
+
+                        st.write(f"{item}: {_fmt_money(simbolo_base, cost)}")
+                        st.progress(pct)
+                        # ---------------------------------------------------------
+# App entrypoint
+# ---------------------------------------------------------
 def main():
-    st.set_page_config(page_title="Calculadora DTG Pro", page_icon="👕", layout="wide")
-    if "calc_mode" not in st.session_state:
-        st.session_state["calc_mode"] = None
-    if "consumo_override" not in st.session_state:
-        st.session_state["consumo_override"] = None
-    if "consumo_file" not in st.session_state:
-        st.session_state["consumo_file"] = None
-    if "last_calc" not in st.session_state:
-        st.session_state["last_calc"] = None
-
-    render_top_header("👕 DTG Cost Calculator")
-    st.markdown("---")
-
-    tab_cost, tab_roi = st.tabs(["Cost", "ROI"])
+    render_top_header("DTG Cost")
+    tab_cost, tab_roi = st.tabs(["Cost", "ROI / Payback"])
     with tab_cost:
         render_cost_tab()
     with tab_roi:
         render_roi_tab()
 
-if __name__ == "__main__":
-    main()
+# Streamlit runs top-to-bottom on each interaction.
+main()

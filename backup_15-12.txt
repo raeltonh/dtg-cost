@@ -1,0 +1,1879 @@
+import re
+from pathlib import Path
+import streamlit as st
+import altair as alt
+import pandas as pd
+from PIL import Image
+import pytesseract
+
+# --- BRANDING / LOGO ---
+BASE_DIR = Path(__file__).resolve().parent
+LOGO_PATH = BASE_DIR / "assets" / "logo.png"
+LOGO_WIDTH = 160  # adjust logo size here
+
+def render_top_header(title_text: str) -> None:
+    """Top header with title (left) and logo (right)."""
+    col_left, col_right = st.columns([0.78, 0.22], vertical_alignment="center")
+    with col_left:
+        st.title(title_text)
+    with col_right:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=LOGO_WIDTH)
+
+# --- CONFIGURAÇÕES E DADOS PADRÃO ---
+FATORES_COMPLEXIDADE = {
+    "Simple (Logo/Chest)": {"fator_velocidade": 1.0, "consumo_ml": 1.0},
+    "Standard (A4 Color)": {"fator_velocidade": 0.9, "consumo_ml": 5.0},
+    "Complex (A3 Solid)": {"fator_velocidade": 0.6, "consumo_ml": 8.0},
+    "Artistic (HD/Fine Art)": {"fator_velocidade": 0.5, "consumo_ml": 10.0}
+}
+
+def extrair_consumo_de_imagem(uploaded_file):
+    try:
+        from PIL import Image
+    except Exception as exc:
+        return None, f"Error loading PIL: {exc}"
+
+    try:
+        img = Image.open(uploaded_file)
+    except Exception as exc:
+        return None, f"Could not open file: {exc}"
+
+    meta_textos = []
+    # Captura metadados conhecidos
+    if hasattr(img, "info"):
+        meta_textos.extend([str(v) for v in img.info.values() if v])
+    if hasattr(img, "text"):
+        meta_textos.extend([str(v) for v in img.text.values() if v])
+    try:
+        if hasattr(img, "tag_v2"):
+            meta_textos.extend([str(v) for v in img.tag_v2.values() if v])
+    except Exception:
+        pass
+    
+    # Fallback: varre o conteúdo bruto
+    try:
+        raw_bytes = uploaded_file.getvalue()
+        if raw_bytes:
+            meta_textos.append(raw_bytes.decode("latin-1", errors="ignore"))
+            meta_textos.append(raw_bytes.decode("utf-8", errors="ignore"))
+            meta_textos.append(raw_bytes.decode("utf-16", errors="ignore"))
+            meta_textos.append(raw_bytes.replace(b"\x00", b"").decode("latin-1", errors="ignore"))
+            raw_clean = re.sub(r"[^A-Za-z0-9\\.,:=\\s]", " ", raw_bytes.replace(b"\x00", b"").decode("latin-1", errors="ignore"))
+            meta_textos.append(raw_clean)
+    except Exception:
+        pass
+
+    if not meta_textos:
+        return None, "Imagem não possui metadados legíveis."
+
+    def _to_float(num_str):
+        if not num_str: return None
+        cleaned = str(num_str)
+        # Common OCR confusions
+        trans = str.maketrans({
+            "l": "1", "I": "1", "O": "0", "o": "0", "S": "5"
+        })
+        cleaned = cleaned.translate(trans)
+        cleaned = cleaned.replace(" ", "")
+        cleaned = cleaned.replace(",", ".")
+        if not re.search(r"\d", cleaned): return None
+
+        # Handle OCR loss of decimal separators like "0389" -> 0.0389
+        if "." not in cleaned and cleaned.strip().startswith("0"):
+            digits = re.sub(r"\D", "", cleaned)
+            if digits:
+                try:
+                    return float(int(digits)) / (10 ** len(digits))
+                except Exception:
+                    pass
+
+        try:
+            return float(cleaned)
+        except ValueError:
+            return None
+
+    def dedup_matches(matches):
+        """Deduplicate matches for both totals (campo/valor) and channels (canal/valor)."""
+        seen = set()
+        uniq = []
+        for m in matches or []:
+            key_name = m.get("campo") if isinstance(m, dict) else None
+            if not key_name and isinstance(m, dict):
+                key_name = m.get("canal")
+            key = (key_name, m.get("bruto") if isinstance(m, dict) else None, m.get("valor") if isinstance(m, dict) else None)
+            if key in seen:
+                continue
+            seen.add(key)
+            uniq.append(m)
+        return uniq
+
+    def parse_totais(blob_text):
+        debug_local = []
+
+        # Tolerante a OCR: Total pode virar TotaI/Tota1 e "=" pode virar "-" ou ":"
+        SEP = r"(?:=|:|\-|—|–)"
+        TOTAL_WORD = r"Tota[lI1]"  # Total / TotaI / Tota1
+
+        def _pick_last(patterns, label):
+            last_val = None
+            for pat in patterns:
+                for m in re.finditer(pat, blob_text, flags=re.IGNORECASE | re.MULTILINE):
+                    val = _to_float(m.group(1))
+                    if val is not None:
+                        last_val = val
+            if last_val is not None:
+                debug_local.append({"campo": label, "valor": last_val})
+            return last_val
+
+        total_c = _pick_last(
+            [
+                rf"(?im)^\s*{TOTAL_WORD}\s*C\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*Colors?\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*CMYK\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*CMYK\s*{TOTAL_WORD}\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*C\s*{SEP}\s*([\d\.,]+)",  # fallback sem depender do começo da linha
+            ],
+            "Total C",
+        )
+
+        total_w = _pick_last(
+            [
+                rf"(?im)^\s*{TOTAL_WORD}\s*W\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*White\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*White\s*{TOTAL_WORD}\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*W\s*{SEP}\s*([\d\.,]+)",
+            ],
+            "Total W",
+        )
+
+        total_q = _pick_last(
+            [
+                rf"(?im)^\s*{TOTAL_WORD}\s*Q(?:fix)?\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*Qfix\s*{SEP}\s*([\d\.,]+)",
+                rf"(?im)^\s*{TOTAL_WORD}\s*Q\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*Q(?:fix)?\s*{SEP}\s*([\d\.,]+)",
+            ],
+            "Total Q",
+        )
+
+        total_all = _pick_last(
+            [
+                rf"(?im)^\s*{TOTAL_WORD}\s*(?![A-Za-z])\s*{SEP}\s*([\d\.,]+)",
+                rf"(?i){TOTAL_WORD}\s*(?![A-Za-z])\s*{SEP}\s*([\d\.,]+)",
+            ],
+            "Total (geral)",
+        )
+
+        uniq_debug = []
+        seen = set()
+        for d in debug_local:
+            if d["campo"] in seen:
+                continue
+            seen.add(d["campo"])
+            uniq_debug.append(d)
+
+        return total_c, total_w, total_q, total_all, uniq_debug
+
+    def parse_canais(blob_text):
+        resultado = []
+
+        SEP = r"(?:=|:|\-|—|–)"
+
+        padroes = [
+            ("C",  rf"(?im)^\s*C\s*{SEP}\s*([\d\.,]+)"),
+            ("M",  rf"(?im)^\s*M\s*{SEP}\s*([\d\.,]+)"),
+            ("Y",  rf"(?im)^\s*Y\s*{SEP}\s*([\d\.,]+)"),
+            ("K",  rf"(?im)^\s*K\s*{SEP}\s*([\d\.,]+)"),
+            ("R",  rf"(?im)^\s*R\s*{SEP}\s*([\d\.,]+)"),  # NEW
+            ("G",  rf"(?im)^\s*G\s*{SEP}\s*([\d\.,]+)"),  # NEW
+            ("Np", rf"(?im)^\s*N\s*p\s*{SEP}\s*([\d\.,]+)"),
+            ("Ny", rf"(?im)^\s*N\s*y\s*{SEP}\s*([\d\.,]+)"),
+            ("Qc", rf"(?im)^\s*Q\s*c\s*{SEP}\s*([\d\.,]+)"),
+            ("PE", rf"(?im)^\s*P\s*E\s*{SEP}\s*([\d\.,]+)"),
+            ("W",  rf"(?im)^\s*W\s*{SEP}\s*([\d\.,]+)"),
+            ("Qw", rf"(?im)^\s*Q\s*w\s*{SEP}\s*([\d\.,]+)"),
+            ("PG", rf"(?im)^\s*P\s*G\s*{SEP}\s*([\d\.,]+)"),
+        ]
+
+        for canal, padrao in padroes:
+            last_val = None
+            for m in re.finditer(padrao, blob_text, flags=re.IGNORECASE | re.MULTILINE):
+                val = _to_float(m.group(1))
+                if val is not None:
+                    last_val = val
+            if last_val is not None:
+                resultado.append({"canal": canal, "valor": last_val})
+
+        return resultado
+
+    blob = "\n".join(meta_textos)
+    total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob)
+    canais_consumo = parse_canais(blob)
+
+    # Fallback: if totals missing but we have channel values, derive totals
+    if not any([total_c, total_w, total_q, total_all]) and canais_consumo:
+        canal_map = {c["canal"]: float(c.get("valor", 0.0)) for c in canais_consumo if c.get("canal")}
+
+        # Sum CMYK-ish channels (includes K, Ny, Np if present)
+        c_comp = sum(canal_map.get(c, 0.0) for c in ["C", "M", "Y", "K", "R", "G", "Ny", "Np"])
+        w_comp = canal_map.get("W", 0.0)
+        q_comp = sum(canal_map.get(c, 0.0) for c in ["Qc", "Qw", "PE", "PG"])
+
+        if c_comp > 0 or w_comp > 0 or q_comp > 0:
+            total_c = c_comp
+            total_w = w_comp
+            total_q = q_comp
+            total_all = c_comp + w_comp + q_comp
+            debug_matches.append({"campo": "Derived totals", "valor": total_all, "bruto": "sum(channels)"})
+
+    if not any([total_c, total_w, total_q, total_all]):
+        try:
+            import pytesseract
+
+            # -----------------------------
+            # OCR preprocessing (focused on CPP left panel)
+            # -----------------------------
+            img_rgb = img.convert("RGB")
+            w, h = img_rgb.size
+
+            # Crops: CPP values are on the left results panel
+            crops = [
+                img_rgb,
+                img_rgb.crop((0, int(h * 0.12), int(w * 0.36), int(h * 0.95))),  # left panel
+                img_rgb.crop((0, int(h * 0.55), int(w * 0.36), int(h * 0.98))),  # totals area (bottom left)
+            ]
+
+            def _prep(im):
+                scale = 2
+                im_up = im.resize((im.size[0] * scale, im.size[1] * scale))
+                gray = im_up.convert("L")
+                bin_light = gray.point(lambda x: 255 if x > 185 else 0)
+                bin_dark = gray.point(lambda x: 255 if x > 160 else 0)
+                return gray, bin_light, bin_dark
+
+            def _run_ocr(im):
+                texts = []
+                for psm in ("6", "11"):
+                    try:
+                        texts.append(pytesseract.image_to_string(im, config=f"--psm {psm}"))
+                    except Exception:
+                        pass
+                return "\n".join([t for t in texts if t])
+
+            ocr_texts = []
+            for cimg in crops:
+                gray, bin_light, bin_dark = _prep(cimg)
+                ocr_texts.append(_run_ocr(bin_light))
+                ocr_texts.append(_run_ocr(bin_dark))
+                ocr_texts.append(_run_ocr(gray))
+
+            ocr_text = "\n".join([t for t in ocr_texts if t]).strip()
+
+            if ocr_text:
+                meta_textos.append(ocr_text)
+
+                # IMPORTANT: keep newlines to help regex with ^ anchors
+                blob_ocr = "\n".join(meta_textos)
+                total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob_ocr)
+                canais_consumo = parse_canais(blob_ocr)
+
+                if debug_matches is not None:
+                    debug_matches.append({"campo": "Fonte", "valor": 0, "bruto": "OCR"})
+        except Exception:
+            pass
+
+    if any([total_c, total_w, total_q]):    
+        total_ml = sum([v for v in [total_c, total_w, total_q] if v is not None])
+        return {
+            "cmyk_ml": total_c or 0.0, "white_ml": total_w or 0.0, "qfix_ml": total_q or 0.0,
+            "total_ml": total_ml if total_ml > 0 else total_all or 0.0,
+            "debug_matches": dedup_matches(debug_matches), "canais_consumo": dedup_matches(canais_consumo)
+        }, None
+
+    if total_all:
+        return {
+            "cmyk_ml": total_all, "white_ml": 0.0, "qfix_ml": 0.0, "total_ml": total_all,
+            "debug_matches": dedup_matches(debug_matches), "canais_consumo": dedup_matches(canais_consumo)
+        }, None
+
+    # ---------------------------------------------------------
+    # Friendly fallback message (avoid showing raw binary noise)
+    # ---------------------------------------------------------
+    keywords = r"(Total\s*C|Total\s*W|Total\s*Q|Qfix|White|CMYK|Qc|Qw|PE|PG)"
+    meta_filtered = [t for t in meta_textos if re.search(keywords, str(t), flags=re.IGNORECASE)]
+
+    preview_source = meta_filtered if meta_filtered else meta_textos
+    preview_text = " ".join([str(x) for x in preview_source])
+
+    # Remove non-printable characters and collapse whitespace
+    preview_text = re.sub(r"[^\x20-\x7E]+", " ", preview_text)
+    preview_text = re.sub(r"\s+", " ", preview_text).strip()
+
+    return None, (
+        "Could not find consumption numbers in this file metadata. "
+        "Please export the CPP summary image with the totals visible "
+        "(e.g., 'Total C', 'Total W', 'Total Q') or use the Manual mode."
+        + (f" Preview: '{preview_text[:180]}...'" if preview_text else "")
+    )
+
+
+# ---------------------------------------------------------
+# Helper: Render CPP Ink Breakdown (wide, professional layout)
+# ---------------------------------------------------------
+def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: pd.DataFrame, desired_order: list[str]):
+    """Render CPP extracted ink breakdown in a wide, readable layout (safe Streamlit layout)."""
+    total_c = float(consumo_file.get("cmyk_ml", 0.0))
+    total_w = float(consumo_file.get("white_ml", 0.0))
+    total_q = float(consumo_file.get("qfix_ml", 0.0))
+    total_all = float(consumo_file.get("total_ml", 0.0))
+
+    st.markdown("### Ink Breakdown (CPP File)")
+    st.caption("Extracted from CPP metadata (ml per piece).")
+
+    # Cards (wide area) — totals
+    c1, c2, c3, c4 = st.columns(4, gap="large")
+    c1.metric("🟦 Total C (CMYK)", f"{total_c:.2f} ml")
+    c2.metric("⬜ Total W (White)", f"{total_w:.2f} ml")
+    c3.metric("🟨 Total Q (Qfix)", f"{total_q:.2f} ml")
+    c4.metric("🧮 Total (overall)", f"{total_all:.2f} ml")
+
+    # Share cards
+    if total_all > 0:
+        pct_c = (total_c / total_all) * 100
+        pct_w = (total_w / total_all) * 100
+        pct_q = (total_q / total_all) * 100
+    else:
+        pct_c = pct_w = pct_q = 0.0
+
+    s1, s2, s3, s4 = st.columns(4, gap="large")
+    s1.metric("📊 CMYK Share", f"{pct_c:.1f}%")
+    s2.metric("📊 White Share", f"{pct_w:.1f}%")
+    s3.metric("📊 Qfix Share", f"{pct_q:.1f}%")
+    s4.metric("💧 Total Ink", f"{total_all:.2f} ml")
+
+
+    st.markdown("")
+
+    col_chart1, col_chart2 = st.columns([1, 1], gap="large")
+
+    with col_chart1:
+        clean_height = 320
+
+        chart_totais = (
+            alt.Chart(totals_df)
+            .mark_bar(size=64, cornerRadius=10)
+            .encode(
+                x=alt.X(
+                    "campo:N",
+                    sort=["Total C", "Total W", "Total Q", "Total (overall)"],
+                    axis=alt.Axis(title=None, labelAngle=0, labelFontSize=12),
+                ),
+                y=alt.Y("valor:Q", title="ml"),
+                color=alt.Color("hex:N", scale=None, legend=None),
+                tooltip=[alt.Tooltip("campo"), alt.Tooltip("valor", format=".2f")],
+            )
+            .properties(height=clean_height)
+        )
+
+        text_totais = (
+            alt.Chart(totals_df)
+            .mark_text(dy=-10, fontSize=13, fontWeight="bold")
+            .encode(
+                x=alt.X(
+                    "campo:N",
+                    sort=["Total C", "Total W", "Total Q", "Total (overall)"]
+                ),
+                y="valor:Q",
+                text=alt.Text("valor:Q", format=".2f"),
+            )
+        )
+
+        st.altair_chart(
+            (chart_totais + text_totais)
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4),
+            width="stretch"
+        )
+
+    with col_chart2:
+        row_height = 28
+        chart_height = max(300, len(df_s) * row_height)
+
+        chart_canais = (
+            alt.Chart(df_s)
+            .mark_bar(size=22, cornerRadius=10)
+            .encode(
+                x=alt.X("valor:Q", title="ml/piece"),
+                y=alt.Y(
+                    "canal:N",
+                    sort=desired_order,
+                    title=None,
+                    axis=alt.Axis(labelFontSize=12, labelPadding=4),
+                ),
+                color=alt.Color("cor:N", scale=None, legend=None),
+                tooltip=["canal", alt.Tooltip("valor", format=".2f")],
+            )
+            .properties(height=chart_height)
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+        )
+
+        st.altair_chart(chart_canais, width="stretch")
+
+def calcular_custo_total(
+    qtd_pedido,
+    velocidade_nominal,
+    eficiencia,
+    complexidade_nome,
+    equipe_salarios,
+    encargos,
+    setup_min,
+    cotacao_usd_brl,
+    preco_tinta_litro,
+    moeda_tinta,
+    preco_tinta_ml_manual,
+    consumo_override,
+    fixation_percent,
+    custo_energia_kwh,
+    moeda_base,
+    horas_mes,
+    consumo_maquina_kw,
+    consumo_forno_kw,
+    machine_value,
+    dep_months,
+    tshirt_cost,
+    service_monthly_total,
+    platform_monthly_fee,
+    platform_fee_per_piece,
+    extras_monthly_total,
+    extras_per_piece_total,
+    service_allocation_method,
+    expected_monthly_pcs,
+    press_enabled,
+    press_cycle_seconds,
+    press_kw,
+    press_value,
+    press_dep_months,
+    press_use_same_labor,
+    press_operator_salary,
+    designer_salary,
+    design_time_hours,
+    print_passes,
+    custom_print_time_min
+):
+    def converter_para_base(valor, moeda_valor):
+        if moeda_valor == moeda_base: return valor
+        if cotacao_usd_brl <= 0: return None
+        if moeda_valor == "USD" and moeda_base == "BRL": return valor * cotacao_usd_brl
+        if moeda_valor == "BRL" and moeda_base == "USD": return valor / cotacao_usd_brl
+        return valor
+
+    if consumo_override:
+        fator_vel = FATORES_COMPLEXIDADE[complexidade_nome]["fator_velocidade"]
+        consumo_ml = consumo_override["total_ml"]
+    else:
+        dados_complexidade = FATORES_COMPLEXIDADE[complexidade_nome]
+        fator_vel = dados_complexidade["fator_velocidade"]
+        consumo_ml = dados_complexidade["consumo_ml"]
+    
+    fix_ml = consumo_ml * (fixation_percent / 100)
+    consumo_ml_total = consumo_ml + fix_ml
+
+    total_salarios = sum(equipe_salarios.values())
+    if horas_mes <= 0: return "Error: monthly hours must be > 0."
+    custo_mensal_equipe = total_salarios * (1 + encargos)
+    custo_hora_equipe = custo_mensal_equipe / horas_mes
+    custo_minuto_equipe = custo_hora_equipe / 60
+
+    # Heat press labor rate (optional dedicated operator)
+    press_custo_hora = float(custo_hora_equipe)
+    if not press_use_same_labor:
+        press_sal = float(press_operator_salary) if press_operator_salary is not None else 0.0
+        press_custo_mensal = press_sal * (1 + encargos)
+        press_custo_hora = (press_custo_mensal / horas_mes) if horas_mes > 0 else 0.0
+
+    vel_real = velocidade_nominal * eficiencia * fator_vel
+    if vel_real == 0: return "Error: zero speed."
+
+    passes = max(1, int(print_passes)) if print_passes is not None else 1
+    if custom_print_time_min and float(custom_print_time_min) > 0:
+        tempo_impressao_min = float(custom_print_time_min)
+    else:
+        tempo_impressao_min = (qtd_pedido / (vel_real / 60)) * passes
+    tempo_total_min = tempo_impressao_min + setup_min
+    
+    custo_total_mo = tempo_total_min * custo_minuto_equipe
+    custo_unit_mo = custo_total_mo / qtd_pedido
+
+    # -------------------------------------------------
+    # Optional prepress/design labor (one-time per job)
+    # Allocated across the order quantity
+    # -------------------------------------------------
+    custo_hora_designer = 0.0
+    custo_design_total = 0.0
+    custo_design_unit = 0.0
+    designer_hours_job = 0.0
+
+    if design_time_hours and float(design_time_hours) > 0 and horas_mes > 0:
+        base_sal_designer = float(designer_salary) if designer_salary is not None else 0.0
+        if base_sal_designer > 0:
+            custo_hora_designer = (base_sal_designer * (1 + float(encargos))) / float(horas_mes)
+        else:
+            custo_hora_designer = 0.0
+
+        designer_hours_job = float(design_time_hours)
+        custo_design_total = designer_hours_job * float(custo_hora_designer)
+        custo_design_unit = (custo_design_total / float(qtd_pedido)) if qtd_pedido > 0 else 0.0
+
+    if preco_tinta_ml_manual is not None:
+        custo_tinta_ml_base = preco_tinta_ml_manual
+        preco_litro_base = custo_tinta_ml_base * 1000
+    else:
+        preco_litro_base = converter_para_base(preco_tinta_litro, moeda_tinta)
+        if preco_litro_base is None: return "Error: invalid FX rate."
+        custo_tinta_ml_base = preco_litro_base / 1000
+    custo_tinta_unit = consumo_ml_total * custo_tinta_ml_base
+    
+    consumo_total_kw = consumo_maquina_kw + consumo_forno_kw
+    horas_job = tempo_total_min / 60
+    total_kwh_job = horas_job * consumo_total_kw
+    custo_energia_total = total_kwh_job * custo_energia_kwh
+    custo_energia_unit = custo_energia_total / qtd_pedido
+    custo_hora_energia = consumo_total_kw * custo_energia_kwh
+
+    # Depreciation (hour and unit) - main printer
+    dep_hour = machine_value / dep_months / horas_mes if dep_months > 0 and horas_mes > 0 else 0.0
+    dep_unit = dep_hour * horas_job / qtd_pedido if qtd_pedido > 0 else 0.0
+
+    # Blank T-shirt cost (per unit)
+    tshirt_unit = float(tshirt_cost)
+
+    # -------------------------------------------------
+    # Optional finishing: Heat Press (Sublimation press)
+    # Includes extra labor time, energy and press depreciation
+    # -------------------------------------------------
+    press_labor_unit = 0.0
+    press_energy_unit = 0.0
+    press_dep_unit = 0.0
+    press_unit_total = 0.0
+    press_dep_hour = 0.0
+    press_hours_job = 0.0
+
+    if press_enabled and press_cycle_seconds and press_cycle_seconds > 0 and qtd_pedido > 0:
+        # Total press time based on seconds per piece
+        press_hours_job = (float(press_cycle_seconds) * float(qtd_pedido)) / 3600.0
+
+        # Labor cost for press operation (same as printing or dedicated operator)
+        press_labor_total = press_hours_job * float(press_custo_hora)
+        press_labor_unit = press_labor_total / float(qtd_pedido)
+
+        # Energy cost for the press
+        press_kwh_job = press_hours_job * float(press_kw)
+        press_energy_total = press_kwh_job * float(custo_energia_kwh)
+        press_energy_unit = press_energy_total / float(qtd_pedido)
+
+        # Depreciation for the press
+        press_dep_hour = (float(press_value) / float(press_dep_months) / float(horas_mes)) if press_dep_months > 0 and horas_mes > 0 else 0.0
+        press_dep_unit = press_dep_hour * press_hours_job / float(qtd_pedido)
+
+        press_unit_total = press_labor_unit + press_energy_unit + press_dep_unit
+
+    # Service & platform fees
+    # Two allocation methods:
+    # 1) "hours"   -> monthly fees converted to hourly rates and applied to job time (current default)
+    # 2) "volume"  -> monthly fees divided by expected monthly production (pcs)
+
+    service_hour = (service_monthly_total / horas_mes) if horas_mes > 0 else 0.0
+    platform_hour = (platform_monthly_fee / horas_mes) if horas_mes > 0 else 0.0
+    extras_hour = (extras_monthly_total / horas_mes) if horas_mes > 0 else 0.0
+
+    # Defaults (hours-based)
+    service_unit = service_hour * horas_job / qtd_pedido
+    platform_unit_fixed = platform_hour * horas_job / qtd_pedido
+    extras_unit_fixed = extras_hour * horas_job / qtd_pedido
+
+    # Volume-based override
+    if service_allocation_method == "volume":
+        denom = float(expected_monthly_pcs) if expected_monthly_pcs and expected_monthly_pcs > 0 else 0.0
+        if denom > 0:
+            service_unit = float(service_monthly_total) / denom
+            platform_unit_fixed = float(platform_monthly_fee) / denom
+            extras_unit_fixed = float(extras_monthly_total) / denom
+        else:
+            service_unit = 0.0
+            platform_unit_fixed = 0.0
+            extras_unit_fixed = 0.0
+
+    platform_unit_var = platform_fee_per_piece
+    extras_unit_var = extras_per_piece_total
+
+    service_platform_unit = (
+        service_unit
+        + platform_unit_fixed
+        + platform_unit_var
+        + extras_unit_fixed
+        + extras_unit_var
+    )
+
+    custo_unit_total = custo_unit_mo + custo_tinta_unit + custo_energia_unit
+    custo_unit_total += dep_unit + tshirt_unit + service_platform_unit + press_unit_total + custo_design_unit
+
+    return {
+        "vel_real": vel_real, "tempo_horas": tempo_total_min / 60,
+        "custo_mo_unit": custo_unit_mo, "custo_design_unit": custo_design_unit, "custo_tinta_unit": custo_tinta_unit,
+        "custo_energia_unit": custo_energia_unit,
+        "custo_dep_unit": dep_unit,
+        "custo_tshirt_unit": tshirt_unit,
+        "custo_service_unit": service_unit,
+        "custo_platform_unit_fixed": platform_unit_fixed,
+        "custo_platform_unit_var": platform_unit_var,
+        "custo_extras_unit_fixed": extras_unit_fixed,
+        "custo_extras_unit_var": extras_unit_var,
+        "custo_service_platform_unit": service_platform_unit,
+        "custo_service_hour": service_hour,
+        "custo_platform_hour": platform_hour,
+        "custo_extras_hour": extras_hour,
+        "custo_press_labor_unit": press_labor_unit,
+        "custo_press_energy_unit": press_energy_unit,
+        "custo_press_dep_unit": press_dep_unit,
+        "custo_press_unit": press_unit_total,
+        "custo_press_dep_hour": press_dep_hour,
+        "press_hours_job": press_hours_job,
+        "custo_press_hour_total": (press_dep_hour + (float(press_kw) * float(custo_energia_kwh)) + float(press_custo_hora)) if press_enabled else 0.0,
+        "custo_final_unit": custo_unit_total,
+        "ml_base": consumo_ml, "ml_fixation": fix_ml, "ml_por_peca": consumo_ml_total,
+        "ml_cmyk": consumo_override["cmyk_ml"] if consumo_override else None,
+        "ml_white": consumo_override["white_ml"] if consumo_override else None,
+        "ml_qfix": consumo_override["qfix_ml"] if consumo_override else None,
+        "preco_tinta_ml_base": custo_tinta_ml_base, "preco_tinta_litro_base": preco_litro_base,
+        "horas_mes": horas_mes,
+        "custo_hora_equipe": custo_hora_equipe,
+        "custo_hora_designer": custo_hora_designer,
+        "custo_hora_press": press_custo_hora,
+        "custo_hora_energia": custo_hora_energia,
+        "custo_dep_hour": dep_hour,
+        "custo_service_platform_hour": (service_hour + platform_hour + extras_hour),
+        "consumo_total_kw": consumo_total_kw,
+        "custo_energia_kwh": custo_energia_kwh,
+        "passes": passes,
+        "tempo_impressao_min": tempo_impressao_min
+    }
+
+
+def render_roi_tab():
+    st.markdown("### ROI / Payback")
+    last_calc = st.session_state.get("last_calc")
+
+    if not last_calc:
+        st.info("Run a cost calculation in the Cost tab first.")
+        return
+
+    result = last_calc.get("result") or {}
+    unit_cost = float(last_calc.get("unit_cost") or result.get("custo_final_unit") or 0.0)
+    simbolo_base = last_calc.get("currency_symbol", "US$")
+    moeda_base = last_calc.get("base_currency", "USD")
+
+    st.caption(
+        f"Base currency: {moeda_base} | Using the last calculated unit cost from the Cost tab."
+    )
+
+    default_price = unit_cost * 1.30 if unit_cost > 0 else 0.0
+    default_volume = int(last_calc.get("order_qty") or 1000)
+    default_investment = float(last_calc.get("machine_value") or 0.0)
+    if last_calc.get("press_enabled"):
+        default_investment += float(last_calc.get("press_value") or 0.0)
+
+    c1, c2, c3 = st.columns(3, gap="large")
+    with c1:
+        selling_price = st.number_input(
+            f"Selling price per piece ({simbolo_base})",
+            min_value=0.0,
+            value=float(default_price),
+            step=0.10,
+            help="Planned selling price. Used to calculate margin and ROI."
+        )
+        unit_margin = selling_price - unit_cost
+        margin_pct = (unit_margin / unit_cost * 100) if unit_cost > 0 else 0.0
+        st.metric("Unit margin", f"{simbolo_base} {unit_margin:.2f}", f"{margin_pct:.1f}% over cost")
+
+    with c2:
+        monthly_volume = st.number_input(
+            "Expected monthly volume (pcs)",
+            min_value=1,
+            value=default_volume,
+            step=100,
+            help="Expected sales volume per month used for payback and ROI."
+        )
+        st.metric("Monthly revenue", f"{simbolo_base} {selling_price * monthly_volume:,.2f}".replace(",", ""))
+
+    with c3:
+        upfront_investment = st.number_input(
+            f"Total upfront investment ({simbolo_base})",
+            min_value=0.0,
+            value=float(default_investment),
+            step=1000.0,
+            help="Sum of equipment and other upfront costs you want to recover."
+        )
+        monthly_extra = st.number_input(
+            f"Extra monthly fixed costs ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=50.0,
+            help="Optional: costs not embedded in the unit cost that should be discounted from monthly profit."
+        )
+
+    profit_monthly = (unit_margin * monthly_volume) - monthly_extra
+    payback_months = (upfront_investment / profit_monthly) if profit_monthly > 0 else None
+    annual_roi_pct = (
+        (profit_monthly * 12 / upfront_investment) * 100
+        if upfront_investment > 0 and profit_monthly > 0 else 0.0
+    )
+    pieces_to_payback = (upfront_investment / unit_margin) if unit_margin > 0 else None
+    breakeven_volume = (monthly_extra / unit_margin) if unit_margin > 0 else None
+
+    st.markdown("---")
+
+    m1, m2, m3, m4 = st.columns(4, gap="large")
+    m1.metric("Unit cost (last run)", f"{simbolo_base} {unit_cost:.2f}")
+    m2.metric("Monthly profit", f"{simbolo_base} {profit_monthly:,.2f}".replace(",", ""))
+    m3.metric("Annual ROI", f"{annual_roi_pct:.1f}%")
+
+    if payback_months:
+        m4.metric("Payback (months)", f"{payback_months:.1f} mo")
+    else:
+        m4.metric("Payback (months)", "—")
+
+    st.markdown("")
+
+    col_left, col_right = st.columns([1, 1], gap="large")
+
+    with col_left:
+        st.markdown("#### Breakeven and payback checkpoints")
+        if unit_margin <= 0:
+            st.error("Selling price is not above unit cost. Increase price or reduce cost to compute ROI.")
+        else:
+            st.write(
+                f"Pieces to recover the upfront investment: "
+                f"**{pieces_to_payback:.0f} pcs**" if pieces_to_payback else "Pieces to recover: —"
+            )
+            st.write(
+                f"Monthly volume to cover extra fixed costs: "
+                f"**{breakeven_volume:.0f} pcs/month**" if breakeven_volume else "Breakeven volume: —"
+            )
+            st.caption("Breakeven ignores upfront investment; payback pieces include it.")
+
+    with col_right:
+        st.markdown("#### Notes")
+        st.info(
+            "ROI uses the last unit cost calculated in the Cost tab. "
+            "Adjust selling price, monthly volume and upfront investment to test scenarios. "
+            "Extra monthly costs are subtracted before ROI is calculated."
+        )
+def render_cost_tab():
+    # -----------------------------------------------------------------
+    # Session state (keeps results visible when widgets change)
+    # -----------------------------------------------------------------
+    if "calc_mode" not in st.session_state:
+        st.session_state["calc_mode"] = None
+    if "consumo_override" not in st.session_state:
+        st.session_state["consumo_override"] = None
+    if "consumo_file" not in st.session_state:
+        st.session_state["consumo_file"] = None
+
+    st.markdown("### General Inputs")
+    c_econ, c_insumo, c_team = st.columns(3, gap="large")
+
+    with c_econ:
+        st.subheader("1. Economic Scenario")
+        moeda_base = st.selectbox(
+            "Base currency",
+            ["USD", "BRL"],
+            0,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Main currency used for all cost results. Other inputs may be converted to this currency."
+        )
+        simbolo_base = "US$" if moeda_base == "USD" else "R$"
+        dolar = st.number_input(
+            "USD -> BRL rate",
+            value=5.50,
+            step=0.01,
+            help="Exchange rate used when converting between USD and BRL."
+        )
+        kwh = st.number_input(
+            f"Energy cost ({simbolo_base}/kWh)",
+            value=0.85,
+            step=0.01,
+            help="Electricity price in the base currency per kWh."
+        )
+        consumo_maquina_kw = st.number_input(
+            "Printer (kW)",
+            value=3.5,
+            step=0.1,
+            help="Average printer power consumption during production."
+        )
+        consumo_forno_kw = st.number_input(
+            "Dryer (kW)",
+            value=4.0,
+            step=0.1,
+            help="Average dryer/curing unit power consumption during production."
+        )
+        st.caption(f"Estimated energy: {simbolo_base} {((consumo_maquina_kw+consumo_forno_kw)*kwh):.2f}/h")
+
+    with c_insumo:
+        st.subheader("2. Ink Costs")
+        modo_preco = st.radio(
+            "Ink price mode",
+            ["Per liter", "Per ml (direct)"],
+            help="Choose how you want to input ink pricing. Per liter will be converted to per ml. Per ml (direct) uses the base currency directly."
+        )
+        preco_tinta_ml_manual = None
+        preco_tinta_litro = 0.0
+        moeda_tinta = "USD"
+        if modo_preco == "Per liter":
+            moeda_tinta = st.selectbox(
+                "Liter currency",
+                ["USD", "BRL"],
+                0,
+                help="Currency of the ink price per liter. It will be converted to the base currency if needed."
+            )
+            preco_tinta_litro = st.number_input(
+                "Ink price per liter",
+                value=160.0,
+                step=1.0,
+                help="Ink price per liter in the selected liter currency."
+            )
+        else:
+            preco_tinta_ml_manual = st.number_input(
+                f"Ink price per ml ({simbolo_base})",
+                value=0.16,
+                step=0.01,
+                format="%.3f",
+                help="Direct ink price per ml in the base currency."
+            )
+
+    with c_team:
+        st.subheader("3. Labor")
+        sal_op = st.number_input(
+            f"Operator ({simbolo_base})",
+            value=3000.0,
+            help="Monthly base salary for the main operator."
+        )
+        sal_aj = st.number_input(
+            f"Assistant ({simbolo_base})",
+            value=2500.0,
+            help="Monthly base salary for the assistant/second operator."
+        )
+        sal_designer = st.number_input(
+            f"Designer ({simbolo_base})",
+            value=0.0,
+            step=100.0,
+            help="Monthly base salary for the designer/prepress resource (optional)."
+        )
+
+        design_time_hours = st.number_input(
+            "Estimated design effort for this order (hours)",
+            value=0.0,
+            step=0.5,
+            help=(
+                "Total design/prepress effort for this order (in hours, not per-piece). "
+                "The value is allocated across the order quantity and added to the unit cost."
+            )
+        )
+        encargos = st.number_input(
+            "Labor burden / overhead (%)",
+            value=0.80,
+            step=0.05,
+            help="Extra labor burden over base salaries (benefits, taxes, HR overhead). Example: 0.80 = +80% over base salaries."
+        )
+        st.caption("Tip: 0.80 = +80% overhead over base salaries.")
+        horas_mes = st.number_input(
+            "Hours/month",
+            value=220,
+            step=10,
+            help="Expected productive hours per month. Used to convert monthly labor and service costs into hourly rates."
+        )
+        if st.button("🔄 Reset", type="secondary"):
+            st.session_state.clear()
+            st.rerun()
+
+    col_capex, col_blank = st.columns(2, gap="large")
+    with col_capex:
+        st.subheader("4. Depreciation")
+
+        machine_currency = st.selectbox(
+            "Machine value currency",
+            ["USD", "BRL"],
+            index=0 if moeda_base == "USD" else 1,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Currency of the machine acquisition value. It will be converted to the base currency for depreciation."
+        )
+
+        machine_value_raw = st.number_input(
+            "Machine value",
+            value=100000.0,
+            step=1000.0,
+            help="Acquisition value of the printer in the selected machine currency."
+        )
+
+        # Convert machine value to base currency (USD/BRL)
+        if machine_currency != moeda_base:
+            if dolar <= 0:
+                st.warning("Invalid USD/BRL rate. Machine value will be used as entered.")
+                machine_value = float(machine_value_raw)
+            else:
+                if machine_currency == "USD" and moeda_base == "BRL":
+                    machine_value = float(machine_value_raw) * float(dolar)
+                elif machine_currency == "BRL" and moeda_base == "USD":
+                    machine_value = float(machine_value_raw) / float(dolar)
+                else:
+                    machine_value = float(machine_value_raw)
+        else:
+            machine_value = float(machine_value_raw)
+
+        st.caption(f"Machine value in base currency: {simbolo_base} {machine_value:,.0f}".replace(",", ""))
+
+        dep_months = st.number_input(
+            "Depreciation (months)",
+            value=36,
+            step=1,
+            help="Useful life in months. The app converts this into an hourly and per-piece depreciation cost."
+        )
+    with col_blank:
+        st.subheader("5. Blank T-shirt")
+        tshirt_cost = st.number_input(
+            f"Blank cost per piece ({simbolo_base})",
+            value=5.0,
+            step=0.1,
+            help="Cost of the blank garment per piece in the base currency."
+        )
+
+    st.markdown("---")
+    st.markdown("### 6. Service & Platform Fees (Optional)")
+
+    col_serv, col_plat = st.columns(2, gap="large")
+
+    with col_serv:
+        st.subheader("Kornit & Maintenance Packages")
+        kornit_pkg_monthly = st.number_input(
+            f"Kornit service package / month ({simbolo_base})",
+            value=0.0,
+            step=100.0,
+            help="Monthly Kornit service contract. This can be allocated per job by hours or by expected monthly volume."
+        )
+        maintenance_monthly = st.number_input(
+            f"General maintenance & parts / month ({simbolo_base})",
+            value=0.0,
+            step=100.0,
+            help="Monthly allowance for parts and preventive maintenance outside the Kornit package."
+        )
+        service_monthly_total = float(kornit_pkg_monthly) + float(maintenance_monthly)
+
+    with col_plat:
+        st.subheader("E-commerce / 3rd-party Printing Fees")
+        platform_monthly_fee = st.number_input(
+            f"Platform fixed fee / month ({simbolo_base})",
+            value=0.0,
+            step=50.0,
+            help="Fixed monthly fee charged by an e-commerce or 3rd-party production platform."
+        )
+        platform_fee_per_piece = st.number_input(
+            f"Platform fee per piece ({simbolo_base})",
+            value=0.0,
+            step=0.05,
+            help="Variable platform fee per printed piece (added directly to unit cost)."
+        )
+
+    st.markdown("")
+    st.subheader("Allocation method")
+
+    service_allocation_method = st.radio(
+        "How should monthly fees be allocated?",
+        options=["hours", "volume"],
+        index=0,
+        format_func=lambda v: "Rate by hours (recommended)" if v == "hours" else "Rate by expected volume",
+        horizontal=True,
+        help=(
+            "Distribute monthly fixed fees (service contracts, platform subscriptions, and other monthly adders) into a per-piece value for this quote.\n\n"
+            "• Rate by hours: converts monthly fees to an hourly rate (monthly_fee ÷ hours/month) and allocates by job time. "
+            "Best when jobs vary in size and run-time.\n"
+            "• Rate by expected volume: spreads monthly fees across the client’s expected monthly output "
+            "(monthly_fee ÷ expected_monthly_pcs). Use when the client prefers a simple fixed add-on per piece."
+        )
+    )
+
+    if service_allocation_method == "hours":
+        st.caption("Hours-based allocation: monthly fees are converted to an hourly rate and applied to this job's production time.")
+    else:
+        st.caption("Volume-based allocation: monthly fees are divided by the client's expected monthly production (not the current order quantity).")
+
+    expected_monthly_pcs = 0
+    if service_allocation_method == "volume":
+        expected_monthly_pcs = st.number_input(
+            "Expected monthly production (pcs)",
+            min_value=1,
+            value=20000,
+            step=1000,
+            help=(
+                "Client-level monthly production estimate used only to allocate monthly fees when 'Rate by expected volume' is selected. "
+                "This is NOT the current order quantity for this job."
+            )
+        )
+    else:
+        st.caption("Hours-based allocation selected. No monthly volume estimate is required.")
+
+    allocation_summary = (
+        "Monthly fees allocation: Hourly rate × job time ÷ order qty."
+        if service_allocation_method == "hours"
+        else "Monthly fees allocation: Monthly fee ÷ expected monthly production (pcs)."
+    )
+
+    formula_used = (
+        "Per-piece monthly fees = (monthly_fee ÷ hours/month) × job_hours ÷ order_qty"
+        if service_allocation_method == "hours"
+        else "Per-piece monthly fees = monthly_fee ÷ expected_monthly_pcs"
+    )
+
+    st.info(
+        allocation_summary
+        + "\n\n"
+        + "Formula used: "
+        + formula_used
+    )
+
+    st.markdown("")
+    st.subheader("Custom cost adders")
+
+    extras_df_default = pd.DataFrame(
+        [
+            {"Description": "Packaging", "Type": "Per piece", "Amount": 0.0},
+            {"Description": "Logistics", "Type": "Per piece", "Amount": 0.0},
+            {"Description": "Software/License", "Type": "Monthly", "Amount": 0.0},
+        ]
+    )
+
+    extras_df = st.data_editor(
+        extras_df_default,
+        num_rows="dynamic",
+        key="extras_cost_adders",
+        column_config={
+            "Description": st.column_config.TextColumn(
+                "Description",
+                help="Short label for the extra cost item."
+            ),
+            "Type": st.column_config.SelectboxColumn(
+                "Type",
+                options=["Monthly", "Per piece"],
+                required=True,
+                help="Monthly costs will be allocated by the selected method. Per piece costs are added directly to unit cost."
+            ),
+            "Amount": st.column_config.NumberColumn(
+                f"Amount ({simbolo_base})",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Value of this cost in the base currency."
+            ),
+        },
+    )
+
+    extras_monthly_total = 0.0
+    extras_per_piece_total = 0.0
+    if isinstance(extras_df, pd.DataFrame) and not extras_df.empty:
+        monthly_series = pd.Series(dtype="float64")
+        per_piece_series = pd.Series(dtype="float64")
+
+        raw_monthly = pd.to_numeric(
+            extras_df.loc[extras_df["Type"] == "Monthly", "Amount"],
+            errors="coerce"
+        )
+        raw_per_piece = pd.to_numeric(
+            extras_df.loc[extras_df["Type"] == "Per piece", "Amount"],
+            errors="coerce"
+        )
+
+        if isinstance(raw_monthly, pd.Series):
+            monthly_series = raw_monthly
+        elif raw_monthly is not None:
+            monthly_series = pd.Series(raw_monthly, dtype="float64")
+
+        if isinstance(raw_per_piece, pd.Series):
+            per_piece_series = raw_per_piece
+        elif raw_per_piece is not None:
+            per_piece_series = pd.Series(raw_per_piece, dtype="float64")
+
+        monthly_vals = monthly_series[pd.notna(monthly_series)]
+        per_piece_vals = per_piece_series[pd.notna(per_piece_series)]
+
+        extras_monthly_total = float(monthly_vals.fillna(0).sum()) if isinstance(monthly_vals, pd.Series) else 0.0
+        extras_per_piece_total = float(per_piece_vals.fillna(0).sum()) if isinstance(per_piece_vals, pd.Series) else 0.0
+
+    st.caption(
+        f"Custom adders totals → Monthly: {simbolo_base} {extras_monthly_total:.2f} | "
+        f"Per piece: {simbolo_base} {extras_per_piece_total:.2f}"
+    )
+
+    # ---------------------------------------------------------
+    # 7. Optional finishing: Heat Press
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### 7. Finishing Option: Heat Press (Optional)")
+
+    press_enabled = st.checkbox(
+        "Include heat press finishing",
+        value=False,
+        help=(
+            "Enable this if the client will finish the garment using a heat press after DTG printing. "
+            "The app will add extra labor time, press energy and press depreciation to the unit cost."
+        )
+    )
+
+    press_use_same_labor = st.checkbox(
+        "Use same labor rate as printing",
+        value=True,
+        help=(
+            "When enabled, the heat press labor cost will use the same hourly rate calculated for the printing team. "
+            "Disable to use a dedicated heat press operator salary."
+        )
+    )
+
+    p1, p2, p3, p4, p5 = st.columns(5, gap="large")
+
+    with p1:
+        press_cycle_seconds = st.number_input(
+            "Press time per piece (seconds)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Average operator time to press one piece, in seconds. Used to calculate additional labor and energy for this finishing step."
+        )
+
+    with p2:
+        press_kw = st.number_input(
+            "Heat press power (kW)",
+            min_value=0.0,
+            value=1.8,
+            step=0.1,
+            help="Average power consumption of the heat press during operation."
+        )
+
+    with p3:
+        press_currency = st.selectbox(
+            "Heat press value currency",
+            ["USD", "BRL"],
+            index=0 if moeda_base == "USD" else 1,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Currency of the heat press acquisition value. It will be converted to the base currency."
+        )
+
+    with p4:
+        press_value_raw = st.number_input(
+            "Heat press value",
+            min_value=0.0,
+            value=2000.0,
+            step=100.0,
+            help="Approximate acquisition value of the heat press in the selected currency."
+        )
+
+    with p5:
+        press_operator_salary = st.number_input(
+            f"Press operator / month ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help=(
+                "Monthly base salary for a dedicated heat press operator. "
+                "Used only when 'Use same labor rate as printing' is disabled."
+            )
+        )
+
+    # Convert press value to base currency
+    if press_currency != moeda_base:
+        if dolar <= 0:
+            press_value = float(press_value_raw)
+            st.warning("Invalid USD/BRL rate. Heat press value will be used as entered.")
+        else:
+            if press_currency == "USD" and moeda_base == "BRL":
+                press_value = float(press_value_raw) * float(dolar)
+            elif press_currency == "BRL" and moeda_base == "USD":
+                press_value = float(press_value_raw) / float(dolar)
+            else:
+                press_value = float(press_value_raw)
+    else:
+        press_value = float(press_value_raw)
+
+    press_dep_months = st.number_input(
+        "Heat press depreciation (months)",
+        min_value=1,
+        value=36,
+        step=1,
+        help="Useful life in months for the heat press. Converted to an hourly and per-piece cost when enabled."
+    )
+
+    if press_enabled:
+        st.caption(
+            f"Heat press value in base currency: {simbolo_base} {press_value:,.0f}".replace(",", "")
+        )
+    if press_enabled and not press_use_same_labor:
+        st.caption("Dedicated press labor rate will be used for the heat press step.")
+        est_press_custo_hora = (
+            (float(press_operator_salary) * (1 + float(encargos)) / float(horas_mes))
+            if float(horas_mes) > 0 else 0.0
+        )
+        st.caption(f"Estimated dedicated press labor rate: {simbolo_base} {est_press_custo_hora:.2f}/h")
+
+    # ---------------------------------------------------------
+    # Order Data (horizontal, full-width)
+    # ---------------------------------------------------------
+    st.markdown("---")
+    st.subheader("📦 Order Data")
+    st.caption("Fill the order details and choose how ink consumption will be defined for this quote.")
+
+    # Pull persisted calculation state
+    calc_mode = st.session_state.get("calc_mode")
+    consumo_override = st.session_state.get("consumo_override")
+    consumo_file = st.session_state.get("consumo_file")
+    erro_file = None
+
+    od1, od2, od3 = st.columns(3, gap="large")
+    with od1:
+        qtd = st.number_input(
+            "Quantity",
+            value=1000,
+            step=50,
+            help="Current order quantity for this quote (used to calculate unit cost and total job cost)."
+        )
+    with od2:
+        complexidade = st.selectbox(
+            "Print complexity",
+            list(FATORES_COMPLEXIDADE.keys()),
+            1,
+            help="Defines default ink consumption and a speed factor when using the Default consumption mode."
+        )
+    with od3:
+        fixation_percent = st.number_input(
+            "Fixation (%)",
+            value=10.0,
+            step=0.5,
+            help="Fixation is calculated as a percentage of ink consumption (e.g., 10% means fixation = 10% of ink ml)."
+        )
+
+    st.markdown("#### Consumption source")
+    st.info(
+        "Choose how ink consumption will be defined for this quote:\n\n"
+        "• Default: uses the preset ml/piece and speed factor from the selected complexity.\n"
+        "• Manual: you type CMYK/White/Qfix ml per piece.\n"
+        "• File (PNG/TIFF): the app extracts Total C/W/Q from a CPP export (with OCR fallback)."
+    )
+    tab_p, tab_m, tab_a = st.tabs(["Default", "Manual", "File (PNG/TIFF)"])
+
+    with tab_p:
+        st.info("Uses the default consumption for the selected complexity.")
+        if st.button("Calculate (Default)", type="primary", key="calc_p"):
+            st.session_state["calc_mode"] = "padrao"
+            st.session_state["consumo_override"] = None
+            st.session_state["cpp_breakdown"] = None
+
+    with tab_m:
+        st.caption("Enter consumption per color (ml/piece).")
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            cm = st.number_input("CMYK ml", min_value=0.0, value=4.0, step=0.1, key="cm_manual_tab")
+            qf = st.number_input("Qfix ml", min_value=0.0, value=0.5, step=0.1, key="qf_manual_tab")
+        with c2:
+            wh = st.number_input("White ml", min_value=0.0, value=1.5, step=0.1, key="wh_manual_tab")
+
+        consumo_manual = {"cmyk_ml": cm, "white_ml": wh, "qfix_ml": qf, "total_ml": cm + wh + qf}
+
+        if st.button("Calculate (Manual)", type="primary", key="calc_m"):
+            st.session_state["calc_mode"] = "manual"
+            st.session_state["consumo_override"] = consumo_manual
+            st.session_state["cpp_breakdown"] = None
+
+    with tab_a:
+        st.caption("Upload the PNG/TIFF exported from CPP Tool (Total C/W/Q).")
+        arquivos = st.file_uploader(
+            "File(s)",
+            ["png", "tif", "tiff", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="up_cpp_tab2",
+            help="Upload one or more CPP summaries (front/back/label). Values are summed."
+        )
+
+        if arquivos:
+            consumos = []
+            erros = []
+            canais_sum = {}
+            file_rows = []
+
+            for arq in arquivos:
+                consumo_file, erro_file = extrair_consumo_de_imagem(arq)
+                if erro_file or consumo_file is None:
+                    erros.append(f"{arq.name}: {erro_file or 'No totals found'}")
+                    continue
+
+                consumos.append((arq.name, consumo_file))
+                file_rows.append({
+                    "File": arq.name,
+                    "CMYK (ml)": consumo_file["cmyk_ml"],
+                    "White (ml)": consumo_file["white_ml"],
+                    "Qfix (ml)": consumo_file["qfix_ml"],
+                    "Total (ml/piece)": consumo_file["total_ml"],
+                })
+
+                for canal in consumo_file.get("canais_consumo", []):
+                    canal_nome = canal.get("canal")
+                    valor = float(canal.get("valor", 0.0))
+                    if canal_nome:
+                        canais_sum[canal_nome] = canais_sum.get(canal_nome, 0.0) + valor
+
+            if not consumos:
+                st.error("Could not extract totals from the uploaded files. " + (" | ".join(erros) if erros else ""))
+                st.session_state["consumo_file"] = None
+                st.session_state["cpp_breakdown"] = None
+            else:
+                total_c = sum(c["cmyk_ml"] for _, c in consumos)
+                total_w = sum(c["white_ml"] for _, c in consumos)
+                total_q = sum(c["qfix_ml"] for _, c in consumos)
+                total_all = sum(c["total_ml"] for _, c in consumos)
+
+                st.success(
+                    f"Summed {len(consumos)} file(s): CMYK={total_c:.2f} ml, "
+                    f"White={total_w:.2f} ml, Qfix={total_q:.2f} ml "
+                    f"(Total {total_all:.2f} ml/piece)."
+                )
+                if erros:
+                    st.warning("Some files were skipped: " + " | ".join(erros))
+
+                if file_rows:
+                    st.dataframe(pd.DataFrame(file_rows), width="stretch", height=220)
+
+                consumo_file_agg = {
+                    "cmyk_ml": total_c,
+                    "white_ml": total_w,
+                    "qfix_ml": total_q,
+                    "total_ml": total_all,
+                    "canais_consumo": [{"canal": k, "valor": v} for k, v in canais_sum.items()],
+                    "debug_matches": [],
+                }
+                st.session_state["consumo_file"] = consumo_file_agg
+
+                color_map = {
+                    "C": "#00bcd4", "M": "#d500f9", "Y": "#ffeb3b", "K": "#212121",
+                    "R": "#f44336", "G": "#4caf50",
+                    "W": "#e0e0e0", "Qc": "#29b6f6", "Qw": "#81d4fa",
+                    "Ny": "#ce93d8", "Np": "#bcaaa4", "PE": "#9575cd", "PG": "#66bb6a"
+                }
+                desired_order = ["C", "M", "Y", "K", "R", "G", "Np", "Ny", "Qc", "PE", "W", "Qw", "PG"]
+
+                df_s = pd.DataFrame(consumo_file_agg.get("canais_consumo", []))
+                present = set(df_s["canal"].tolist()) if not df_s.empty else set()
+                for canal in desired_order:
+                    if canal not in present:
+                        df_s = pd.concat([df_s, pd.DataFrame([{"canal": canal, "valor": 0}])], ignore_index=True)
+
+                df_s["canal"] = pd.Categorical(df_s["canal"], categories=desired_order, ordered=True)
+                df_s = df_s.sort_values("canal")
+
+                color_series = df_s["canal"].map(color_map).astype(object)
+                df_s["cor"] = color_series.where(color_series.notna(), "#9e9e9e")
+
+                totals_df = pd.DataFrame([
+                    {"campo": "Total C", "valor": total_c, "hex": "#64b5f6"},
+                    {"campo": "Total W", "valor": total_w, "hex": "#1976d2"},
+                    {"campo": "Total Q", "valor": total_q, "hex": "#42a5f5"},
+                    {"campo": "Total (overall)", "valor": total_all, "hex": "#b3e5fc"},
+                ])
+
+                st.session_state["cpp_breakdown"] = {
+                    "consumo_file": consumo_file_agg,
+                    "df_s": df_s,
+                    "totals_df": totals_df,
+                    "desired_order": desired_order,
+                }
+
+                st.info("Ink Breakdown will be displayed in the Results panel for a wider, cleaner view.")
+
+        if st.button("Calculate (File)", type="primary", key="calc_a"):
+            if st.session_state.get("consumo_file") is None:
+                st.error("Upload at least one valid file before calculating.")
+            else:
+                st.session_state["calc_mode"] = "arquivo"
+                st.session_state["consumo_override"] = st.session_state.get("consumo_file")
+
+    st.markdown("#### Production parameters")
+    sp1, sp2, sp3 = st.columns(3, gap="large")
+
+    with sp1:
+        vel_nominal = st.number_input(
+            "Speed (pcs/h)",
+            value=120,
+            help="Nominal machine speed before applying efficiency and the selected complexity factor."
+        )
+    with sp2:
+        eficiencia = st.slider(
+            "Efficiency",
+            0.4, 1.0, 0.70,
+            help="Real-world efficiency applied to the nominal speed (accounts for pauses, handling, and operational losses)."
+        )
+    with sp3:
+        setup = st.number_input(
+            "Setup (min)",
+            value=15,
+            help="Preparation time added once per job (loading, alignment, tests). Included in total job time."
+        )
+
+    mp1, mp2 = st.columns(2, gap="large")
+    with mp1:
+        print_passes = st.number_input(
+            "Print passes (front/back/label)",
+            min_value=1,
+            value=1,
+            step=1,
+            help="Use 1 for a single print, 2 for front+back, 3 for front+back+label, etc. Increases print time."
+        )
+    with mp2:
+        custom_print_time_min = st.number_input(
+            "Override total print time (min)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Optional: replace calculated print time with a measured total (before setup). Handy when you time multiple passes manually (e.g., 3 cycles × 23 min)."
+        )
+
+    # Sync local variables with persisted state
+    calc_mode = st.session_state.get("calc_mode")
+    consumo_override = st.session_state.get("consumo_override")
+
+    if calc_mode == "padrao":
+        consumo_override = None
+        st.session_state["consumo_override"] = None
+
+    # Keep a container alias so the results code below can remain unchanged
+    col_result = st.container()
+
+    calc_btn = calc_mode is not None
+
+    if calc_btn:
+        res = calcular_custo_total(
+            qtd,
+            vel_nominal,
+            eficiencia,
+            complexidade,
+            {"Op": sal_op, "Aj": sal_aj},
+            encargos,
+            setup,
+            dolar,
+            preco_tinta_litro,
+            moeda_tinta,
+            preco_tinta_ml_manual,
+            consumo_override,
+            fixation_percent,
+            kwh,
+            moeda_base,
+            horas_mes,
+            consumo_maquina_kw,
+            consumo_forno_kw,
+            machine_value,
+            dep_months,
+            tshirt_cost,
+            service_monthly_total,
+            platform_monthly_fee,
+            platform_fee_per_piece,
+            extras_monthly_total,
+            extras_per_piece_total,
+            service_allocation_method,
+            expected_monthly_pcs,
+            press_enabled,
+            press_cycle_seconds,
+            press_kw,
+            press_value,
+            press_dep_months,
+            press_use_same_labor,
+            press_operator_salary,
+            sal_designer,
+            design_time_hours,
+            print_passes,
+            custom_print_time_min,
+        )
+        if isinstance(res, str):
+            st.error(res)
+            return
+        unit_cost = float(res["custo_final_unit"])
+        st.session_state["last_calc"] = {
+            "unit_cost": unit_cost,
+            "currency_symbol": simbolo_base,
+            "base_currency": moeda_base,
+            "order_qty": qtd,
+            "result": res,
+            "machine_value": machine_value,
+            "press_value": press_value,
+            "press_enabled": press_enabled,
+        }
+
+        with col_result:
+            st.subheader("📊 Financial Result")
+            # ---------------------------------------------------------
+            # CPP Ink Breakdown (wide)
+            # ---------------------------------------------------------
+            cpp_payload = st.session_state.get("cpp_breakdown")
+            if isinstance(cpp_payload, dict):
+                try:
+                    render_cpp_ink_breakdown(
+                        cpp_payload["consumo_file"],
+                        cpp_payload["df_s"],
+                        cpp_payload["totals_df"],
+                        cpp_payload["desired_order"],
+                    )
+                    st.markdown("---")
+                except Exception:
+                    pass
+            k1, k2, k3 = st.columns(3)
+            k1.metric("Unit Cost", f"{simbolo_base} {res['custo_final_unit']:.2f}")
+            k2.metric("Total Time", f"{res['tempo_horas']:.1f} h")
+            k3.metric("Real Speed", f"{int(res['vel_real'])} pcs/h")
+
+            # ---------------------------------------------------------
+            # Job Cost Summary
+            # ---------------------------------------------------------
+            total_job_cost = float(res["custo_final_unit"]) * float(qtd)
+            service_platform_pp = float(res.get("custo_service_platform_unit", 0.0))
+
+            batch_size = st.selectbox(
+                "Batch size (summary only)",
+                [50, 100, 250, 500, 1000],
+                index=1,
+                key="batch_size_summary",
+                help=(
+                    "Reference lot size used only to display a quick commercial summary. "
+                    "This does NOT change unit cost, job time, charts, or the real order total."
+                )
+            )
+            st.caption("For reporting only — unit cost remains unchanged.")
+            cost_per_batch = float(res["custo_final_unit"]) * float(batch_size)
+
+            press_pp = float(res.get("custo_press_unit", 0.0))
+
+            jc1, jc2, jc3, jc4 = st.columns(4, gap="large")
+            jc1.metric("Total job cost", f"{simbolo_base} {total_job_cost:,.2f}".replace(",", ""))
+            jc2.metric(f"Cost per reference batch ({batch_size} pcs)", f"{simbolo_base} {cost_per_batch:,.2f}".replace(",", ""))
+            jc3.metric("Service/Platform per piece", f"{simbolo_base} {service_platform_pp:.2f}")
+            jc4.metric("Heat press per piece", f"{simbolo_base} {press_pp:.2f}")
+
+            if press_enabled:
+                press_labor_rate_used = float(res.get("custo_hora_press", 0.0))
+                st.caption(f"Heat press enabled — {simbolo_base} {press_pp:.2f} per piece included in unit cost.")
+                st.caption(f"Heat press labor rate used: {simbolo_base} {press_labor_rate_used:.2f}/h")
+            else:
+                st.caption("Heat press not included in this quote.")
+
+            st.markdown("")
+
+            # ---------------------------------------------------------
+            # Insights & Pricing (balanced layout)
+            # ---------------------------------------------------------
+
+            top_left, top_right = st.columns([1, 1], gap="large")
+
+            with top_left:
+                # ---------------------------------------------------------
+                # Operational Snapshot
+                # ---------------------------------------------------------
+                st.markdown("### Operational Snapshot")
+                st.caption("Job execution metrics based on the inputs.")
+
+                ink_per_piece = float(res.get("ml_por_peca", 0.0))
+                fix_per_piece = float(res.get("ml_fixation", 0.0))
+                total_ink_job_ml = ink_per_piece * float(qtd)
+                total_ink_job_l = total_ink_job_ml / 1000.0
+                total_kwh_job = float(res.get("tempo_horas", 0.0)) * float(res.get("consumo_total_kw", 0.0))
+
+                r1a, r1b = st.columns(2, gap="large")
+                with r1a:
+                    st.metric("Order Qty", f"{int(qtd)} pcs")
+                with r1b:
+                    st.metric("Complexity", str(complexidade).split(" (")[0])
+
+                r2a, r2b = st.columns(2, gap="large")
+                with r2a:
+                    st.metric("Efficiency", f"{eficiencia*100:.0f}%")
+                with r2b:
+                    st.metric("Setup", f"{setup:.0f} min")
+
+                r3a, r3b = st.columns(2, gap="large")
+                with r3a:
+                    st.metric("Ink / piece", f"{ink_per_piece:.2f} ml")
+                with r3b:
+                    st.metric("Fix / piece", f"{fix_per_piece:.2f} ml")
+
+                r4a, r4b = st.columns(2, gap="large")
+                with r4a:
+                    st.metric("Total ink / job", f"{total_ink_job_l:.2f} L")
+                with r4b:
+                    st.metric("Energy / job", f"{total_kwh_job:.2f} kWh")
+
+                st.markdown("")
+
+                st.markdown("#### Recommended price ladder")
+
+                conservative_price = unit_cost * 1.20
+                standard_price = unit_cost * 1.30
+                aggressive_price = unit_cost * 1.50
+                if press_enabled and press_pp > 0:
+                    st.caption(f"Unit cost includes heat press: {simbolo_base} {press_pp:.2f} / piece")
+
+                lp1, lp2, lp3 = st.columns(3, gap="large")
+
+                with lp1:
+                    st.metric("Conservative 20%", f"{simbolo_base} {conservative_price:.2f}")
+                with lp2:
+                    st.metric("Standard 30%", f"{simbolo_base} {standard_price:.2f}")
+                with lp3:
+                    st.metric("Aggressive 50%", f"{simbolo_base} {aggressive_price:.2f}")
+
+                st.caption(
+                    f"Suggested selling range: {simbolo_base} {conservative_price:.2f} → "
+                    f"{simbolo_base} {standard_price:.2f} → {simbolo_base} {aggressive_price:.2f}"
+                )
+
+                st.markdown("")
+
+                # ---------------------------------------------
+                # Assumptions (advanced)
+                # ---------------------------------------------
+                with st.expander("Assumptions (advanced)", expanded=False):
+                    st.caption("Key cost parameters used in the calculation.")
+
+                    dep_month_value = (machine_value / dep_months) if dep_months and dep_months > 0 else 0.0
+
+                    a1, a2 = st.columns(2, gap="large")
+                    with a1:
+                        st.caption("Ink / ml")
+                        st.markdown(f"**{simbolo_base} {float(res.get('preco_tinta_ml_base', 0.0)):.3f}**")
+                    with a2:
+                        st.caption("Energy / kWh")
+                        st.markdown(f"**{simbolo_base} {float(res.get('custo_energia_kwh', 0.0)):.3f}**")
+
+                    a3, a4 = st.columns(2, gap="large")
+                    with a3:
+                        st.caption("Dep / month")
+                        st.markdown(f"**{simbolo_base} {dep_month_value:.2f}**")
+                    with a4:
+                        st.caption("Labor / hour")
+                        st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_equipe', 0.0)):.2f}**")
+
+                    if design_time_hours and float(design_time_hours) > 0:
+                        st.markdown("**Design assumptions**")
+                        d1, d2 = st.columns(2, gap="large")
+                        with d1:
+                            st.caption("Designer labor / hour")
+                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_designer', 0.0)):.2f}**")
+                        with d2:
+                            st.caption("Design effort / order")
+                            st.markdown(f"**{float(design_time_hours):.1f} h**")
+
+                    if press_enabled:
+                        st.markdown("**Heat press assumptions**")
+                        hp1, hp2, hp3 = st.columns(3, gap="large")
+                        with hp1:
+                            st.caption("Press labor / hour")
+                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_press', 0.0)):.2f}**")
+                        with hp2:
+                            st.caption("Press dep / hour")
+                            st.markdown(f"**{simbolo_base} {float(res.get('custo_press_dep_hour', 0.0)):.2f}**")
+                        with hp3:
+                            st.caption("Press energy / hour")
+                            press_energy_hour = float(press_kw) * float(kwh) if press_kw and kwh else 0.0
+                            st.markdown(f"**{simbolo_base} {press_energy_hour:.2f}**")
+
+                    st.caption("Blank / piece")
+                    st.markdown(f"**{simbolo_base} {float(tshirt_cost):.2f}**")
+
+            with top_right:
+                # ---------------------------------------------------------
+                # Pricing & Margin
+                # ---------------------------------------------------------
+                st.markdown("### Pricing Tools")
+                st.caption("Selling price suggestions and quick profit checks based on unit cost.")
+                st.info(
+                    "This section helps convert cost into a selling strategy.\n\n"
+                    "• The pricing table uses markup over cost.\n"
+                    "• Margin shown here is calculated as: (Sell − Cost) / Cost.\n"
+                    "• Use the Quick calculator to test a selling price or set a target markup."
+                )
+
+                sp_pp = float(res.get("custo_service_platform_unit", 0.0))
+                if sp_pp > 0:
+                    st.caption(f"Including Service/Platform: {simbolo_base} {sp_pp:.2f} per piece.")
+
+                pm_left, pm_right = st.columns([1.35, 0.90], gap="large")
+
+                with pm_left:
+                    target_margins = [10, 20, 30, 40, 50, 60]
+                    rows = []
+                    for m in target_margins:
+                        price = unit_cost * (1 + m / 100)
+                        rows.append({
+                            "Target margin": f"{m}%",
+                            "Sell price": f"{simbolo_base} {price:.2f}",
+                            "Profit/unit": f"{simbolo_base} {price - unit_cost:.2f}",
+                            "Service/Platform": f"{simbolo_base} {sp_pp:.2f}" if sp_pp > 0 else f"{simbolo_base} 0.00",
+                        })
+
+                    df_pricing = pd.DataFrame(rows)
+                    st.dataframe(df_pricing, width="stretch", height=220)
+
+                with pm_right:
+                    st.caption("Quick calculator")
+
+                    default_sell = unit_cost * 1.30 if unit_cost > 0 else 0.0
+
+                    sell_price_input = st.number_input(
+                        f"Selling price per piece ({simbolo_base})",
+                        min_value=0.0,
+                        value=float(default_sell),
+                        step=0.10,
+                        key="sell_price_input",
+                        help="Enter your intended selling price to see the resulting markup over cost."
+                    )
+
+                    desired_margin_input = st.number_input(
+                        "Target margin over cost (%)",
+                        min_value=0.0,
+                        value=30.0,
+                        step=1.0,
+                        key="desired_margin_input",
+                        help="Enter a target markup percentage over unit cost to calculate a recommended selling price."
+                    )
+
+                    profit_pct_from_price = ((sell_price_input - unit_cost) / unit_cost * 100) if unit_cost > 0 else 0.0
+                    suggested_price_from_pct = unit_cost * (1 + desired_margin_input / 100)
+
+                    cA, cB = st.columns(2, gap="large")
+                    with cA:
+                        st.caption("Margin from price")
+                        st.markdown(f"**{profit_pct_from_price:.1f}%**")
+                    with cB:
+                        st.caption("Price from target")
+                        st.markdown(f"**{simbolo_base} {suggested_price_from_pct:.2f}**")
+
+                    st.caption("Margin is calculated as markup over cost: (Sell − Cost) / Cost.")
+
+            st.markdown("")
+
+            st.markdown("### Cost Breakdown Overview")
+            col_chart_a, col_chart_b = st.columns(2, gap="large")
+
+            with col_chart_a:
+                st.markdown("#### Hourly Cost Drivers")
+                st.caption("How fixed monthly costs translate into hourly operational cost.")
+                df_hora = pd.DataFrame([
+                    {"Tipo": "Labor", "Valor": res["custo_hora_equipe"]},
+                    {"Tipo": "Energy", "Valor": res["custo_hora_energia"]},
+                    {"Tipo": "Depreciation", "Valor": res["custo_dep_hour"]},
+                    {"Tipo": "Service/Platform", "Valor": res.get("custo_service_platform_hour", 0.0)},
+                ])
+                base_hora = alt.Chart(df_hora).encode(
+                    x=alt.X(
+                        "Tipo:N",
+                        axis=alt.Axis(labelAngle=0, title=None),
+                        scale=alt.Scale(padding=0.4),
+                    ),
+                    y=alt.Y("Valor:Q", title=f"Cost per hour ({simbolo_base}/h)"),
+                    tooltip=["Tipo", alt.Tooltip("Valor", format=".2f")]
+                )
+                bars_hora = base_hora.mark_bar(cornerRadius=14, size=70).encode(
+                    color=alt.Color(
+                        "Tipo:N",
+                        scale=alt.Scale(scheme="tealblues"),
+                        legend=None,
+                    )
+                )
+                text_hora = base_hora.mark_text(dy=-14, fontSize=16, fontWeight='bold').encode(
+                    text=alt.Text("Valor:Q", format=".2f")
+                )
+                st.altair_chart(
+                    (bars_hora + text_hora)
+                    .properties(height=360)
+                    .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.6)
+                    .configure_view(stroke=None),
+                    width="stretch"
+                )
+
+            with col_chart_b:
+                st.markdown("#### Unit Cost Composition")
+                st.caption("Per-piece cost breakdown including ink, blank, and allocated monthly fees.")
+                df_unit = pd.DataFrame([
+                    {"Item": "Labor", "Custo": res["custo_mo_unit"]},
+                    {"Item": "Design", "Custo": res.get("custo_design_unit", 0.0)},
+                    {"Item": "Ink", "Custo": res["custo_tinta_unit"]},
+                    {"Item": "Energy", "Custo": res["custo_energia_unit"]},
+                    {"Item": "Depreciation", "Custo": res["custo_dep_unit"]},
+                    {"Item": "Service/Platform", "Custo": res.get("custo_service_platform_unit", 0.0)},
+                    {"Item": "Heat press", "Custo": res.get("custo_press_unit", 0.0)},
+                    {"Item": "T-shirt", "Custo": res["custo_tshirt_unit"]},
+                ])
+                base_unit = alt.Chart(df_unit).encode(
+                    x=alt.X(
+                        "Item:N",
+                        sort=["Labor", "Design", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"],
+                        axis=alt.Axis(labelAngle=0, title=None),
+                        scale=alt.Scale(padding=0.3),
+                    ),
+                    y=alt.Y("Custo:Q", title=f"Cost per piece ({simbolo_base})"),
+                    tooltip=["Item", alt.Tooltip("Custo", format=".2f")]
+                )
+                bars_unit = base_unit.mark_bar(cornerRadius=14, size=70).encode(
+                    color=alt.Color(
+                        "Item:N",
+                        scale=alt.Scale(scheme="orangered"),
+                        legend=None,
+                    )
+                )
+                text_unit = base_unit.mark_text(dy=-14, fontSize=16, fontWeight='bold').encode(
+                    text=alt.Text("Custo:Q", format=".2f")
+                )
+                st.altair_chart(
+                    (bars_unit + text_unit)
+                    .properties(height=360)
+                    .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.6)
+                    .configure_view(stroke=None),
+                    width="stretch"
+                )
+
+            # Progress bars
+            st.markdown("---")
+            st.caption("Percentual distribution:")
+            total = res['custo_final_unit']
+            st.progress(res['custo_mo_unit']/total, f"Labor: {simbolo_base} {res['custo_mo_unit']:.2f}")
+            st.progress(res.get('custo_design_unit', 0.0)/total, f"Design: {simbolo_base} {res.get('custo_design_unit', 0.0):.2f}")
+            st.progress(res['custo_tinta_unit']/total, f"Ink: {simbolo_base} {res['custo_tinta_unit']:.2f}")
+            st.progress(res['custo_energia_unit']/total, f"Energy: {simbolo_base} {res['custo_energia_unit']:.2f}")
+            st.progress(res['custo_dep_unit']/total, f"Depreciation: {simbolo_base} {res['custo_dep_unit']:.2f}")
+            st.progress(res.get('custo_service_platform_unit', 0.0)/total, f"Service/Platform: {simbolo_base} {res.get('custo_service_platform_unit', 0.0):.2f}")
+            st.progress(res.get('custo_press_unit', 0.0)/total, f"Heat press: {simbolo_base} {res.get('custo_press_unit', 0.0):.2f}")
+            st.progress(res['custo_tshirt_unit']/total, f"T-shirt: {simbolo_base} {res['custo_tshirt_unit']:.2f}")
+
+
+def main():
+    st.set_page_config(page_title="Calculadora DTG Pro", page_icon="👕", layout="wide")
+    if "calc_mode" not in st.session_state:
+        st.session_state["calc_mode"] = None
+    if "consumo_override" not in st.session_state:
+        st.session_state["consumo_override"] = None
+    if "consumo_file" not in st.session_state:
+        st.session_state["consumo_file"] = None
+    if "last_calc" not in st.session_state:
+        st.session_state["last_calc"] = None
+
+    render_top_header("👕 DTG Cost Calculator")
+    st.markdown("---")
+
+    tab_cost, tab_roi = st.tabs(["Cost", "ROI"])
+    with tab_cost:
+        render_cost_tab()
+    with tab_roi:
+        render_roi_tab()
+
+if __name__ == "__main__":
+    main()
