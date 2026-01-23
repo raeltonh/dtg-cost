@@ -445,6 +445,7 @@ def calcular_custo_total(
     consumo_forno_kw,
     machine_value,
     dep_months,
+    residual_value,
     tshirt_cost,
     service_monthly_total,
     platform_monthly_fee,
@@ -516,8 +517,8 @@ def calcular_custo_total(
         tempo_impressao_h = (float(qtd_pedido) / float(vel_real)) * float(passes)
         tempo_impressao_min = float(tempo_impressao_h) * 60.0
 
-    # Safety guard: if something makes time unrealistically small, re-derive from qty/speed
-    if (not custom_print_time_min or float(custom_print_time_min) <= 0) and float(qtd_pedido) > 0 and float(vel_real) > 0:
+    # Safety guard: never allow time below what speed implies
+    if float(qtd_pedido) > 0 and float(vel_real) > 0:
         min_expected_min = (float(qtd_pedido) / float(vel_real)) * float(passes) * 60.0
         if float(tempo_impressao_min) < (0.90 * float(min_expected_min)):
             tempo_impressao_min = float(min_expected_min)
@@ -598,7 +599,10 @@ def calcular_custo_total(
     consumo_total_kw = float(consumo_maquina_kw) + float(consumo_forno_kw)
 
     # Depreciation (hour and unit) - main printer
-    dep_hour = machine_value / dep_months / horas_mes if dep_months > 0 and horas_mes > 0 else 0.0
+    # If you expect to resell the printer after the depreciation period,
+    # use the expected resale value as a residual/salvage value to reduce the depreciable base.
+    depreciable_base = max(float(machine_value) - float(residual_value), 0.0)
+    dep_hour = depreciable_base / dep_months / horas_mes if dep_months > 0 and horas_mes > 0 else 0.0
     dep_unit = dep_hour * horas_job / qtd_pedido if qtd_pedido > 0 else 0.0
 
     # Blank T-shirt cost (per unit)
@@ -708,6 +712,8 @@ def calcular_custo_total(
         "custo_hora_press": press_custo_hora,
         "custo_hora_energia": custo_hora_energia,
         "custo_dep_hour": dep_hour,
+        "residual_value": float(residual_value),
+        "depreciable_base": float(depreciable_base),
         "custo_service_platform_hour": (service_hour + platform_hour + extras_hour),
         "consumo_total_kw": consumo_total_kw,
         "custo_energia_kwh": custo_energia_kwh,
@@ -727,26 +733,808 @@ def calcular_custo_total(
 
 def render_roi_tab():
     st.markdown("### ROI / Payback")
-    last_calc = st.session_state.get("last_calc")
+    st.caption("This tab is independent from the Cost tab. All inputs are entered here.")
 
-    if not last_calc:
-        st.info("Run a cost calculation in the Cost tab first.")
-        return
+    if "roi_calc_mode" not in st.session_state:
+        st.session_state["roi_calc_mode"] = None
+    if "roi_consumo_override" not in st.session_state:
+        st.session_state["roi_consumo_override"] = None
+    if "roi_consumo_file" not in st.session_state:
+        st.session_state["roi_consumo_file"] = None
 
-    result = last_calc.get("result") or {}
-    unit_cost = float(last_calc.get("unit_cost") or result.get("custo_final_unit") or 0.0)
-    simbolo_base = last_calc.get("currency_symbol", "US$")
-    moeda_base = last_calc.get("base_currency", "USD")
+    st.markdown("### Cost Inputs (ROI)")
+    c_econ, c_insumo, c_team = st.columns(3, gap="large")
 
-    st.caption(
-        f"Base currency: {moeda_base} | Using the last calculated unit cost from the Cost tab."
+    with c_econ:
+        st.subheader("1. Economic Scenario")
+        moeda_base = st.selectbox(
+            "Base currency",
+            ["USD", "BRL"],
+            0,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Main currency used for all cost results. Other inputs may be converted to this currency.",
+            key="roi_base_currency"
+        )
+        simbolo_base = "US$" if moeda_base == "USD" else "R$"
+        dolar = st.number_input(
+            "USD -> BRL rate",
+            value=5.50,
+            step=0.01,
+            help="Exchange rate used when converting between USD and BRL.",
+            key="roi_dolar"
+        )
+        kwh = st.number_input(
+            f"Energy cost ({simbolo_base}/kWh)",
+            value=0.85,
+            step=0.01,
+            help="Electricity price in the base currency per kWh.",
+            key="roi_kwh"
+        )
+        consumo_maquina_kw = st.number_input(
+            "Printer (kW)",
+            value=3.5,
+            step=0.1,
+            help="Average printer power consumption during production.",
+            key="roi_printer_kw"
+        )
+        consumo_forno_kw = st.number_input(
+            "Dryer (kW)",
+            value=4.0,
+            step=0.1,
+            help="Average dryer/curing unit power consumption during production.",
+            key="roi_dryer_kw"
+        )
+        st.caption(f"Estimated energy: {simbolo_base} {((consumo_maquina_kw+consumo_forno_kw)*kwh):.2f}/h")
+
+    with c_insumo:
+        st.subheader("2. Ink Costs")
+        modo_preco = st.radio(
+            "Ink price mode",
+            ["Per liter", "Per ml (direct)"],
+            help="Choose how you want to input ink pricing. Per liter will be converted to per ml. Per ml (direct) uses the base currency directly.",
+            key="roi_ink_mode"
+        )
+        preco_tinta_ml_manual = None
+        preco_tinta_litro = 0.0
+        moeda_tinta = "USD"
+        if modo_preco == "Per liter":
+            moeda_tinta = st.selectbox(
+                "Liter currency",
+                ["USD", "BRL"],
+                0,
+                help="Currency of the ink price per liter. It will be converted to the base currency if needed.",
+                key="roi_ink_liter_currency"
+            )
+            preco_tinta_litro = st.number_input(
+                "Ink price per liter",
+                value=160.0,
+                step=1.0,
+                help="Ink price per liter in the selected liter currency.",
+                key="roi_ink_liter_price"
+            )
+        else:
+            preco_tinta_ml_manual = st.number_input(
+                f"Ink price per ml ({simbolo_base})",
+                value=0.16,
+                step=0.01,
+                format="%.3f",
+                help="Direct ink price per ml in the base currency.",
+                key="roi_ink_ml_price"
+            )
+
+    with c_team:
+        st.subheader("3. Labor")
+        sal_op = st.number_input(
+            f"Operator ({simbolo_base})",
+            value=3000.0,
+            help="Monthly base salary for the main operator.",
+            key="roi_sal_op"
+        )
+        sal_aj = st.number_input(
+            f"Assistant ({simbolo_base})",
+            value=2500.0,
+            help="Monthly base salary for the assistant/second operator.",
+            key="roi_sal_aj"
+        )
+        sal_designer = st.number_input(
+            f"Designer ({simbolo_base})",
+            value=0.0,
+            step=100.0,
+            help="Monthly base salary for the designer/prepress resource (optional).",
+            key="roi_sal_designer"
+        )
+
+        design_time_hours = st.number_input(
+            "Estimated design effort for this order (hours)",
+            value=0.0,
+            step=0.5,
+            help=(
+                "Total design/prepress effort for this order (in hours, not per-piece). "
+                "The value is allocated across the order quantity and added to the unit cost."
+            ),
+            key="roi_design_time_hours"
+        )
+        encargos = st.number_input(
+            "Labor burden / overhead (%)",
+            value=0.80,
+            step=0.05,
+            help="Extra labor burden over base salaries (benefits, taxes, HR overhead). Example: 0.80 = +80% over base salaries.",
+            key="roi_encargos"
+        )
+        st.caption("Tip: 0.80 = +80% overhead over base salaries.")
+        horas_mes = st.number_input(
+            "Hours/month",
+            value=220,
+            step=10,
+            help="Expected productive hours per month. Used to convert monthly labor and service costs into hourly rates.",
+            key="roi_horas_mes"
+        )
+
+    col_capex, col_blank = st.columns(2, gap="large")
+    with col_capex:
+        st.subheader("4. Depreciation")
+
+        machine_currency = st.selectbox(
+            "Machine value currency",
+            ["USD", "BRL"],
+            index=0 if moeda_base == "USD" else 1,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Currency of the machine acquisition value. It will be converted to the base currency for depreciation.",
+            key="roi_machine_currency"
+        )
+
+        machine_value_raw = st.number_input(
+            "Machine value",
+            value=100000.0,
+            step=1000.0,
+            help="Acquisition value of the printer in the selected machine currency.",
+            key="roi_machine_value"
+        )
+
+        if machine_currency != moeda_base:
+            if dolar <= 0:
+                st.warning("Invalid USD/BRL rate. Machine value will be used as entered.")
+                machine_value = float(machine_value_raw)
+            else:
+                if machine_currency == "USD" and moeda_base == "BRL":
+                    machine_value = float(machine_value_raw) * float(dolar)
+                elif machine_currency == "BRL" and moeda_base == "USD":
+                    machine_value = float(machine_value_raw) / float(dolar)
+                else:
+                    machine_value = float(machine_value_raw)
+        else:
+            machine_value = float(machine_value_raw)
+
+        st.caption(f"Machine value in base currency: {simbolo_base} {machine_value:,.0f}".replace(",", ""))
+
+        dep_months = st.number_input(
+            "Depreciation (months)",
+            value=36,
+            step=1,
+            help="Useful life in months. The app converts this into an hourly and per-piece depreciation cost.",
+            key="roi_dep_months"
+        )
+
+        st.markdown("**Residual / Resale value (optional)**")
+        resale_currency = st.selectbox(
+            "Resale value currency",
+            ["USD", "BRL"],
+            index=0 if moeda_base == "USD" else 1,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Expected resale value at the end of the depreciation period. This reduces the depreciable base.",
+            key="roi_resale_currency"
+        )
+        resale_value_raw = st.number_input(
+            "Expected resale value",
+            value=0.0,
+            step=1000.0,
+            help="If you plan to sell the machine later, enter the expected resale price (in the selected currency).",
+            key="roi_resale_value"
+        )
+
+        if resale_currency != moeda_base:
+            if dolar <= 0:
+                st.warning("Invalid USD/BRL rate. Resale value will be used as entered.")
+                residual_value = float(resale_value_raw)
+            else:
+                if resale_currency == "USD" and moeda_base == "BRL":
+                    residual_value = float(resale_value_raw) * float(dolar)
+                elif resale_currency == "BRL" and moeda_base == "USD":
+                    residual_value = float(resale_value_raw) / float(dolar)
+                else:
+                    residual_value = float(resale_value_raw)
+        else:
+            residual_value = float(resale_value_raw)
+
+        st.caption(f"Resale value in base currency: {simbolo_base} {residual_value:,.0f}".replace(",", ""))
+        st.caption(f"Depreciable base: {simbolo_base} {max(machine_value - residual_value, 0.0):,.0f}".replace(",", ""))
+
+    with col_blank:
+        st.subheader("5. Blank T-shirt")
+        tshirt_cost = st.number_input(
+            f"Blank cost per piece ({simbolo_base})",
+            value=5.0,
+            step=0.1,
+            help="Cost of the blank garment per piece in the base currency.",
+            key="roi_tshirt_cost"
+        )
+
+    st.markdown("---")
+    st.markdown("### 6. Service & Platform Fees (Optional)")
+
+    col_serv, col_plat = st.columns(2, gap="large")
+
+    with col_serv:
+        st.subheader("Kornit & Maintenance Packages")
+        kornit_pkg_monthly = st.number_input(
+            f"Kornit service package / month ({simbolo_base})",
+            value=0.0,
+            step=100.0,
+            help="Monthly Kornit service contract. This can be allocated per job by hours or by expected monthly volume.",
+            key="roi_kornit_pkg_monthly"
+        )
+        maintenance_monthly = st.number_input(
+            f"General maintenance & parts / month ({simbolo_base})",
+            value=0.0,
+            step=100.0,
+            help="Monthly allowance for parts and preventive maintenance outside the Kornit package.",
+            key="roi_maintenance_monthly"
+        )
+        service_monthly_total = float(kornit_pkg_monthly) + float(maintenance_monthly)
+
+    with col_plat:
+        st.subheader("E-commerce / 3rd-party Printing Fees")
+        platform_monthly_fee = st.number_input(
+            f"Platform fixed fee / month ({simbolo_base})",
+            value=0.0,
+            step=50.0,
+            help="Fixed monthly fee charged by an e-commerce or 3rd-party production platform.",
+            key="roi_platform_monthly_fee"
+        )
+        platform_fee_per_piece = st.number_input(
+            f"Platform fee per piece ({simbolo_base})",
+            value=0.0,
+            step=0.05,
+            help="Variable platform fee per printed piece (added directly to unit cost).",
+            key="roi_platform_fee_per_piece"
+        )
+
+    st.markdown("")
+    st.subheader("Allocation method")
+
+    service_allocation_method = st.radio(
+        "How should monthly fees be allocated?",
+        options=["hours", "volume"],
+        index=0,
+        format_func=lambda v: "Rate by hours (recommended)" if v == "hours" else "Rate by expected volume",
+        horizontal=True,
+        help=(
+            "Distribute monthly fixed fees (service contracts, platform subscriptions, and other monthly adders) into a per-piece value for this quote.\n\n"
+            "• Rate by hours: converts monthly fees to an hourly rate (monthly_fee ÷ hours/month) and allocates by job time. "
+            "Best when jobs vary in size and run-time.\n"
+            "• Rate by expected volume: spreads monthly fees across the client’s expected monthly output "
+            "(monthly_fee ÷ expected_monthly_pcs). Use when the client prefers a simple fixed add-on per piece."
+        ),
+        key="roi_service_allocation_method"
     )
 
+    if service_allocation_method == "hours":
+        st.caption("Hours-based allocation: monthly fees are converted to an hourly rate and applied to this job's production time.")
+    else:
+        st.caption("Volume-based allocation: monthly fees are divided by the client's expected monthly production (not the current order quantity).")
+
+    expected_monthly_pcs = 0
+    if service_allocation_method == "volume":
+        expected_monthly_pcs = st.number_input(
+            "Expected monthly production (pcs)",
+            min_value=1,
+            value=20000,
+            step=1000,
+            help=(
+                "Client-level monthly production estimate used only to allocate monthly fees when 'Rate by expected volume' is selected. "
+                "This is NOT the current order quantity for this job."
+            ),
+            key="roi_expected_monthly_pcs"
+        )
+    else:
+        st.caption("Hours-based allocation selected. No monthly volume estimate is required.")
+
+    allocation_summary = (
+        "Monthly fees allocation: Hourly rate × job time ÷ order qty."
+        if service_allocation_method == "hours"
+        else "Monthly fees allocation: Monthly fee ÷ expected monthly production (pcs)."
+    )
+
+    formula_used = (
+        "Per-piece monthly fees = (monthly_fee ÷ hours/month) × job_hours ÷ order_qty"
+        if service_allocation_method == "hours"
+        else "Per-piece monthly fees = monthly_fee ÷ expected_monthly_pcs"
+    )
+
+    st.info(
+        allocation_summary
+        + "\n\n"
+        + "Formula used: "
+        + formula_used
+    )
+
+    st.markdown("")
+    st.subheader("Custom cost adders")
+
+    extras_df_default = pd.DataFrame(
+        [
+            {"Description": "Packaging", "Type": "Per piece", "Amount": 0.0},
+            {"Description": "Logistics", "Type": "Per piece", "Amount": 0.0},
+            {"Description": "Software/License", "Type": "Monthly", "Amount": 0.0},
+        ]
+    )
+
+    extras_df = st.data_editor(
+        extras_df_default,
+        num_rows="dynamic",
+        key="roi_extras_cost_adders",
+        column_config={
+            "Description": st.column_config.TextColumn(
+                "Description",
+                help="Short label for the extra cost item."
+            ),
+            "Type": st.column_config.SelectboxColumn(
+                "Type",
+                options=["Monthly", "Per piece"],
+                required=True,
+                help="Monthly costs will be allocated by the selected method. Per piece costs are added directly to unit cost."
+            ),
+            "Amount": st.column_config.NumberColumn(
+                f"Amount ({simbolo_base})",
+                min_value=0.0,
+                step=0.01,
+                format="%.2f",
+                help="Value of this cost in the base currency."
+            ),
+        },
+    )
+
+    extras_monthly_total = 0.0
+    extras_per_piece_total = 0.0
+    if isinstance(extras_df, pd.DataFrame) and not extras_df.empty:
+        monthly_series = pd.Series(dtype="float64")
+        per_piece_series = pd.Series(dtype="float64")
+
+        raw_monthly = pd.to_numeric(
+            extras_df.loc[extras_df["Type"] == "Monthly", "Amount"],
+            errors="coerce"
+        )
+        raw_per_piece = pd.to_numeric(
+            extras_df.loc[extras_df["Type"] == "Per piece", "Amount"],
+            errors="coerce"
+        )
+
+        if isinstance(raw_monthly, pd.Series):
+            monthly_series = raw_monthly
+        elif raw_monthly is not None:
+            monthly_series = pd.Series(raw_monthly, dtype="float64")
+
+        if isinstance(raw_per_piece, pd.Series):
+            per_piece_series = raw_per_piece
+        elif raw_per_piece is not None:
+            per_piece_series = pd.Series(raw_per_piece, dtype="float64")
+
+        monthly_vals = monthly_series[pd.notna(monthly_series)]
+        per_piece_vals = per_piece_series[pd.notna(per_piece_series)]
+
+        extras_monthly_total = float(monthly_vals.fillna(0).sum()) if isinstance(monthly_vals, pd.Series) else 0.0
+        extras_per_piece_total = float(per_piece_vals.fillna(0).sum()) if isinstance(per_piece_vals, pd.Series) else 0.0
+
+    st.caption(
+        f"Custom adders totals → Monthly: {simbolo_base} {extras_monthly_total:.2f} | "
+        f"Per piece: {simbolo_base} {extras_per_piece_total:.2f}"
+    )
+
+    st.markdown("---")
+    st.markdown("### 7. Finishing Option: Heat Press (Optional)")
+
+    press_enabled = st.checkbox(
+        "Include heat press finishing",
+        value=False,
+        help=(
+            "Enable this if the client will finish the garment using a heat press after DTG printing. "
+            "The app will add extra labor time, press energy and press depreciation to the unit cost."
+        ),
+        key="roi_press_enabled"
+    )
+
+    press_use_same_labor = st.checkbox(
+        "Use same labor rate as printing",
+        value=True,
+        help=(
+            "When enabled, the heat press labor cost will use the same hourly rate calculated for the printing team. "
+            "Disable to use a dedicated heat press operator salary."
+        ),
+        key="roi_press_use_same_labor"
+    )
+
+    p1, p2, p3, p4, p5 = st.columns(5, gap="large")
+
+    with p1:
+        press_cycle_seconds = st.number_input(
+            "Press time per piece (seconds)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Average operator time to press one piece, in seconds. Used to calculate additional labor and energy for this finishing step.",
+            key="roi_press_cycle_seconds"
+        )
+
+    with p2:
+        press_kw = st.number_input(
+            "Heat press power (kW)",
+            min_value=0.0,
+            value=1.8,
+            step=0.1,
+            help="Average power consumption of the heat press during operation.",
+            key="roi_press_kw"
+        )
+
+    with p3:
+        press_currency = st.selectbox(
+            "Heat press value currency",
+            ["USD", "BRL"],
+            index=0 if moeda_base == "USD" else 1,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Currency of the heat press acquisition value. It will be converted to the base currency.",
+            key="roi_press_currency"
+        )
+
+    with p4:
+        press_value_raw = st.number_input(
+            "Heat press value",
+            min_value=0.0,
+            value=2000.0,
+            step=100.0,
+            help="Approximate acquisition value of the heat press in the selected currency.",
+            key="roi_press_value"
+        )
+
+    with p5:
+        press_operator_salary = st.number_input(
+            f"Press operator / month ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help=(
+                "Monthly base salary for a dedicated heat press operator. "
+                "Used only when 'Use same labor rate as printing' is disabled."
+            ),
+            key="roi_press_operator_salary"
+        )
+
+    if press_currency != moeda_base:
+        if dolar <= 0:
+            press_value = float(press_value_raw)
+            st.warning("Invalid USD/BRL rate. Heat press value will be used as entered.")
+        else:
+            if press_currency == "USD" and moeda_base == "BRL":
+                press_value = float(press_value_raw) * float(dolar)
+            elif press_currency == "BRL" and moeda_base == "USD":
+                press_value = float(press_value_raw) / float(dolar)
+            else:
+                press_value = float(press_value_raw)
+    else:
+        press_value = float(press_value_raw)
+
+    press_dep_months = st.number_input(
+        "Heat press depreciation (months)",
+        min_value=1,
+        value=36,
+        step=1,
+        help="Useful life in months for the heat press. Converted to an hourly and per-piece cost when enabled.",
+        key="roi_press_dep_months"
+    )
+
+    if press_enabled:
+        st.caption(
+            f"Heat press value in base currency: {simbolo_base} {press_value:,.0f}".replace(",", "")
+        )
+    if press_enabled and not press_use_same_labor:
+        st.caption("Dedicated press labor rate will be used for the heat press step.")
+        est_press_custo_hora = (
+            (float(press_operator_salary) * (1 + float(encargos)) / float(horas_mes))
+            if float(horas_mes) > 0 else 0.0
+        )
+        st.caption(f"Estimated dedicated press labor rate: {simbolo_base} {est_press_custo_hora:.2f}/h")
+
+    st.markdown("---")
+    st.subheader("📦 Order Data")
+    st.caption("Fill the order details and choose how ink consumption will be defined for this ROI.")
+
+    calc_mode = st.session_state.get("roi_calc_mode")
+    consumo_override = st.session_state.get("roi_consumo_override")
+    consumo_file = st.session_state.get("roi_consumo_file")
+    erro_file = None
+
+    od1, od2, od3 = st.columns(3, gap="large")
+    with od1:
+        qtd = st.number_input(
+            "Quantity",
+            value=1000,
+            step=50,
+            help="Current order quantity for this ROI scenario.",
+            key="roi_qty"
+        )
+    with od2:
+        complexidade = st.selectbox(
+            "Print complexity",
+            list(FATORES_COMPLEXIDADE.keys()),
+            1,
+            help="Defines default ink consumption and a speed factor when using the Default consumption mode.",
+            key="roi_complexity"
+        )
+    with od3:
+        fixation_percent = st.number_input(
+            "Fixation (%)",
+            value=10.0,
+            step=0.5,
+            help="Fixation is calculated as a percentage of ink consumption.",
+            key="roi_fixation_percent"
+        )
+
+    st.markdown("#### Consumption source")
+    st.info(
+        "Choose how ink consumption will be defined for this ROI:\n\n"
+        "• Default: uses the preset ml/piece and speed factor from the selected complexity.\n"
+        "• Manual: you type CMYK/White/Qfix ml per piece.\n"
+        "• File (PNG/TIFF): the app extracts Total C/W/Q from a CPP export (with OCR fallback)."
+    )
+    tab_p, tab_m, tab_a = st.tabs(["Default", "Manual", "File (PNG/TIFF)"])
+
+    with tab_p:
+        st.info("Uses the default consumption for the selected complexity.")
+        if st.button("Calculate (Default)", type="primary", key="roi_calc_p"):
+            st.session_state["roi_calc_mode"] = "padrao"
+            st.session_state["roi_consumo_override"] = None
+
+    with tab_m:
+        st.caption("Enter consumption per color (ml/piece).")
+        c1, c2 = st.columns(2, gap="large")
+        with c1:
+            cm = st.number_input("CMYK ml", min_value=0.0, value=4.0, step=0.1, key="roi_cm_manual_tab")
+            qf = st.number_input("Qfix ml", min_value=0.0, value=0.5, step=0.1, key="roi_qf_manual_tab")
+        with c2:
+            wh = st.number_input("White ml", min_value=0.0, value=1.5, step=0.1, key="roi_wh_manual_tab")
+
+        consumo_manual = {"cmyk_ml": cm, "white_ml": wh, "qfix_ml": qf, "total_ml": cm + wh + qf}
+
+        if st.button("Calculate (Manual)", type="primary", key="roi_calc_m"):
+            st.session_state["roi_calc_mode"] = "manual"
+            st.session_state["roi_consumo_override"] = consumo_manual
+
+    with tab_a:
+        st.caption("Upload the PNG/TIFF exported from CPP Tool (Total C/W/Q).")
+        arquivos = st.file_uploader(
+            "File(s)",
+            ["png", "tif", "tiff", "jpg", "jpeg"],
+            accept_multiple_files=True,
+            key="roi_up_cpp_tab2",
+            help="Upload one or more CPP summaries (front/back/label). Values are summed."
+        )
+
+        if arquivos:
+            consumos = []
+            erros = []
+
+            for arq in arquivos:
+                consumo_file, erro_file = extrair_consumo_de_imagem(arq)
+                if erro_file or consumo_file is None:
+                    erros.append(f"{arq.name}: {erro_file or 'No totals found'}")
+                    continue
+
+                consumos.append((arq.name, consumo_file))
+
+            if not consumos:
+                st.error("Could not extract totals from the uploaded files. " + (" | ".join(erros) if erros else ""))
+                st.session_state["roi_consumo_file"] = None
+            else:
+                total_c = sum(c["cmyk_ml"] for _, c in consumos)
+                total_w = sum(c["white_ml"] for _, c in consumos)
+                total_q = sum(c["qfix_ml"] for _, c in consumos)
+                total_all = sum(c["total_ml"] for _, c in consumos)
+
+                st.success(
+                    f"Summed {len(consumos)} file(s): CMYK={total_c:.2f} ml, "
+                    f"White={total_w:.2f} ml, Qfix={total_q:.2f} ml "
+                    f"(Total {total_all:.2f} ml/piece)."
+                )
+                if erros:
+                    st.warning("Some files were skipped: " + " | ".join(erros))
+
+                consumo_file_agg = {
+                    "cmyk_ml": total_c,
+                    "white_ml": total_w,
+                    "qfix_ml": total_q,
+                    "total_ml": total_all,
+                    "canais_consumo": [],
+                    "debug_matches": [],
+                }
+                st.session_state["roi_consumo_file"] = consumo_file_agg
+
+        if st.button("Calculate (File)", type="primary", key="roi_calc_a"):
+            if st.session_state.get("roi_consumo_file") is None:
+                st.error("Upload at least one valid file before calculating.")
+            else:
+                st.session_state["roi_calc_mode"] = "arquivo"
+                st.session_state["roi_consumo_override"] = st.session_state.get("roi_consumo_file")
+
+    st.markdown("#### Production parameters")
+    sp1, sp2, sp3 = st.columns(3, gap="large")
+
+    with sp1:
+        vel_nominal = st.number_input(
+            "Speed (pcs/h)",
+            value=120,
+            help="Nominal machine speed before applying efficiency and the selected complexity factor.",
+            key="roi_speed"
+        )
+    with sp2:
+        eficiencia = st.slider(
+            "Efficiency",
+            0.4, 1.0, 0.70,
+            help="Real-world efficiency applied to the nominal speed (accounts for pauses, handling, and operational losses).",
+            key="roi_efficiency"
+        )
+    with sp3:
+        setup = st.number_input(
+            "Setup (min)",
+            value=15,
+            help="Preparation time added once per job (loading, alignment, tests). Included in total job time.",
+            key="roi_setup"
+        )
+
+    mp1, mp2 = st.columns(2, gap="large")
+    with mp1:
+        print_passes = st.number_input(
+            "Print passes (front/back/label)",
+            min_value=1,
+            value=1,
+            step=1,
+            help="Use 1 for a single print, 2 for front+back, 3 for front+back+label, etc. Increases print time.",
+            key="roi_print_passes"
+        )
+    with mp2:
+        custom_print_time_min = st.number_input(
+            "Override total print time (min)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Optional: replace calculated print time with a measured total (before setup). If lower than speed implies, the app keeps the minimum based on speed.",
+            key="roi_custom_print_time_min"
+        )
+
+    st.markdown("#### Curing model (per pass)")
+
+    curing_model = st.selectbox(
+        "Curing time model",
+        options=["Legacy (included in job time)", "Batch curing per pass (front/back/label)"],
+        index=0,
+        help=(
+            "Legacy: keeps current behavior (dryer energy/time considered across the whole job time).\n"
+            "Batch curing per pass: adds curing time as batches for EACH print pass (front/back/label)."
+        ),
+        key="roi_curing_model"
+    )
+
+    curing_model_key = "batch_per_pass" if curing_model.startswith("Batch") else "legacy"
+
+    dryer_batch_size = 10
+    cure_time_min = 23.0
+    cure_handling_min = 0.0
+
+    if curing_model_key == "batch_per_pass":
+        ccu1, ccu2, ccu3 = st.columns(3, gap="large")
+        with ccu1:
+            dryer_batch_size = st.number_input(
+                "Dryer batch capacity (pcs)",
+                min_value=1,
+                value=10,
+                step=1,
+                help="How many T-shirts fit in ONE curing cycle (batch).",
+                key="roi_dryer_batch_size"
+            )
+        with ccu2:
+            cure_time_min = st.number_input(
+                "Cure time per batch (min)",
+                min_value=0.0,
+                value=23.0,
+                step=1.0,
+                help="Fixed curing time per batch (e.g., 23 minutes).",
+                key="roi_cure_time_min"
+            )
+        with ccu3:
+            cure_handling_min = st.number_input(
+                "Load/Unload add-on per batch (min)",
+                min_value=0.0,
+                value=0.0,
+                step=0.5,
+                help="Optional handling time per batch (loading/unloading/rack handling).",
+                key="roi_cure_handling_min"
+            )
+
+        import math
+        cycles_preview = int(math.ceil(float(qtd) / float(dryer_batch_size))) if qtd and dryer_batch_size else 0
+        total_cure_preview = float(print_passes) * float(cycles_preview) * float(cure_time_min + cure_handling_min)
+        st.caption(
+            f"Preview: {cycles_preview} batch(es) per pass × {int(print_passes)} pass(es) → "
+            f"{total_cure_preview:.1f} min curing time added."
+        )
+
+    calc_mode = st.session_state.get("roi_calc_mode")
+    consumo_override = st.session_state.get("roi_consumo_override")
+
+    if calc_mode == "padrao":
+        consumo_override = None
+        st.session_state["roi_consumo_override"] = None
+
+    st.markdown("---")
+    st.subheader("ROI Inputs")
+
+    calc_btn = calc_mode is not None
+
+    if calc_btn:
+        res = calcular_custo_total(
+            qtd,
+            vel_nominal,
+            eficiencia,
+            complexidade,
+            {"Op": sal_op, "Aj": sal_aj},
+            encargos,
+            setup,
+            dolar,
+            preco_tinta_litro,
+            moeda_tinta,
+            preco_tinta_ml_manual,
+            consumo_override,
+            fixation_percent,
+            kwh,
+            moeda_base,
+            horas_mes,
+            consumo_maquina_kw,
+            consumo_forno_kw,
+            machine_value,
+            dep_months,
+            residual_value,
+            tshirt_cost,
+            service_monthly_total,
+            platform_monthly_fee,
+            platform_fee_per_piece,
+            extras_monthly_total,
+            extras_per_piece_total,
+            service_allocation_method,
+            expected_monthly_pcs,
+            press_enabled,
+            press_cycle_seconds,
+            press_kw,
+            press_value,
+            press_dep_months,
+            press_use_same_labor,
+            press_operator_salary,
+            sal_designer,
+            design_time_hours,
+            print_passes,
+            custom_print_time_min,
+            curing_model_key,
+            dryer_batch_size,
+            cure_time_min,
+            cure_handling_min,
+        )
+        if isinstance(res, str):
+            st.error(res)
+            return
+        unit_cost = float(res["custo_final_unit"])
+    else:
+        st.info("Choose a consumption source and click Calculate to enable ROI.")
+        return
+
+    st.markdown("#### ROI setup")
     default_price = unit_cost * 1.30 if unit_cost > 0 else 0.0
-    default_volume = int(last_calc.get("order_qty") or 1000)
-    default_investment = float(last_calc.get("machine_value") or 0.0)
-    if last_calc.get("press_enabled"):
-        default_investment += float(last_calc.get("press_value") or 0.0)
 
     c1, c2, c3 = st.columns(3, gap="large")
     with c1:
@@ -755,7 +1543,8 @@ def render_roi_tab():
             min_value=0.0,
             value=float(default_price),
             step=0.10,
-            help="Planned selling price. Used to calculate margin and ROI."
+            help="Planned selling price. Used to calculate margin and ROI.",
+            key="roi_selling_price"
         )
         unit_margin = selling_price - unit_cost
         margin_pct = (unit_margin / unit_cost * 100) if unit_cost > 0 else 0.0
@@ -765,9 +1554,10 @@ def render_roi_tab():
         monthly_volume = st.number_input(
             "Expected monthly volume (pcs)",
             min_value=1,
-            value=default_volume,
+            value=int(qtd),
             step=100,
-            help="Expected sales volume per month used for payback and ROI."
+            help="Expected sales volume per month used for payback and ROI.",
+            key="roi_monthly_volume"
         )
         st.metric("Monthly revenue", f"{simbolo_base} {selling_price * monthly_volume:,.2f}".replace(",", ""))
 
@@ -775,31 +1565,80 @@ def render_roi_tab():
         upfront_investment = st.number_input(
             f"Total upfront investment ({simbolo_base})",
             min_value=0.0,
-            value=float(default_investment),
+            value=0.0,
             step=1000.0,
-            help="Sum of equipment and other upfront costs you want to recover."
+            help="Sum of equipment and other upfront costs you want to recover.",
+            key="roi_upfront_investment"
         )
         monthly_extra = st.number_input(
             f"Extra monthly fixed costs ({simbolo_base})",
             min_value=0.0,
             value=0.0,
             step=50.0,
-            help="Optional: costs not embedded in the unit cost that should be discounted from monthly profit."
+            help="Optional: costs not embedded in the unit cost that should be discounted from monthly profit.",
+            key="roi_monthly_extra"
         )
 
-    profit_monthly = (unit_margin * monthly_volume) - monthly_extra
-    payback_months = (upfront_investment / profit_monthly) if profit_monthly > 0 else None
-    annual_roi_pct = (
-        (profit_monthly * 12 / upfront_investment) * 100
-        if upfront_investment > 0 and profit_monthly > 0 else 0.0
+    st.markdown("#### Resale value (optional)")
+    st.caption("Use this only if you realistically expect to sell the equipment. Keep it at 0 for a conservative view.")
+    r1, r2, r3 = st.columns(3, gap="large")
+    with r1:
+        resale_value = st.number_input(
+            f"Expected resale value at end ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=1000.0,
+            help="Estimated equipment resale value at the end of the horizon. Use 0 if resale is uncertain.",
+            key="roi_resale_value_roi"
+        )
+    with r2:
+        resale_treatment = st.selectbox(
+            "Resale treatment in ROI",
+            ["Reduce investment (net)", "Terminal cash inflow at end"],
+            index=0,
+            help="Net reduces the investment base. Terminal inflow keeps full investment and adds resale at the end.",
+            key="roi_resale_treatment"
+        )
+    with r3:
+        horizon_months = st.number_input(
+            "Horizon for ROI (months)",
+            min_value=1,
+            value=36,
+            step=1,
+            help="Time horizon used when resale is treated as a terminal inflow or for NPV.",
+            key="roi_horizon_months"
+        )
+
+    st.info(
+        "Tip: keep resale at 0 for a conservative ROI. "
+        "If you want to test an optimistic scenario, enter a resale value and use Terminal cash inflow + NPV."
     )
-    pieces_to_payback = (upfront_investment / unit_margin) if unit_margin > 0 else None
+
+    profit_monthly = (unit_margin * monthly_volume) - monthly_extra
+    use_net_investment = resale_treatment.startswith("Reduce")
+    effective_investment = max(upfront_investment - resale_value, 0.0) if use_net_investment else upfront_investment
+    terminal_inflow = resale_value if not use_net_investment else 0.0
+
+    payback_months = (effective_investment / profit_monthly) if profit_monthly > 0 else None
+    if use_net_investment:
+        annual_roi_pct = (
+            (profit_monthly * 12 / effective_investment) * 100
+            if effective_investment > 0 and profit_monthly > 0 else 0.0
+        )
+    else:
+        annual_roi_pct = (
+            ((profit_monthly * float(horizon_months) + terminal_inflow) / upfront_investment)
+            / (float(horizon_months) / 12.0) * 100
+            if upfront_investment > 0 and horizon_months > 0 else 0.0
+        )
+
+    pieces_to_payback = (effective_investment / unit_margin) if unit_margin > 0 else None
     breakeven_volume = (monthly_extra / unit_margin) if unit_margin > 0 else None
 
     st.markdown("---")
 
     m1, m2, m3, m4 = st.columns(4, gap="large")
-    m1.metric("Unit cost (last run)", f"{simbolo_base} {unit_cost:.2f}")
+    m1.metric("Unit cost (ROI)", f"{simbolo_base} {unit_cost:.2f}")
     m2.metric("Monthly profit", f"{simbolo_base} {profit_monthly:,.2f}".replace(",", ""))
     m3.metric("Annual ROI", f"{annual_roi_pct:.1f}%")
 
@@ -809,6 +1648,12 @@ def render_roi_tab():
         m4.metric("Payback (months)", "—")
 
     st.markdown("")
+    resale_note = "Net investment (resale deducted)" if use_net_investment else "Terminal resale at end"
+    st.caption(f"ROI treatment: {resale_note}.")
+    if resale_value > 0:
+        st.caption(
+            f"Effective investment for ROI: {simbolo_base} {effective_investment:,.2f}".replace(",", "")
+        )
 
     col_left, col_right = st.columns([1, 1], gap="large")
 
@@ -818,22 +1663,49 @@ def render_roi_tab():
             st.error("Selling price is not above unit cost. Increase price or reduce cost to compute ROI.")
         else:
             st.write(
-                f"Pieces to recover the upfront investment: "
+                f"Minimum pieces to recover investment: "
                 f"**{pieces_to_payback:.0f} pcs**" if pieces_to_payback else "Pieces to recover: —"
             )
             st.write(
                 f"Monthly volume to cover extra fixed costs: "
                 f"**{breakeven_volume:.0f} pcs/month**" if breakeven_volume else "Breakeven volume: —"
             )
-            st.caption("Breakeven ignores upfront investment; payback pieces include it.")
+            if use_net_investment:
+                st.caption("Breakeven ignores investment; payback pieces use net investment (after resale).")
+            else:
+                st.caption("Breakeven ignores investment; payback pieces ignore terminal resale.")
 
     with col_right:
         st.markdown("#### Notes")
         st.info(
-            "ROI uses the last unit cost calculated in the Cost tab. "
+            "ROI uses the unit cost calculated in this tab. "
             "Adjust selling price, monthly volume and upfront investment to test scenarios. "
-            "Extra monthly costs are subtracted before ROI is calculated."
+            "Extra monthly costs are subtracted before ROI is calculated. "
+            "Resale value can reduce the investment or be treated as a terminal cash inflow."
         )
+
+    with st.expander("NPV (optional)", expanded=False):
+        discount_rate = st.number_input(
+            "Annual discount rate (%)",
+            min_value=0.0,
+            value=0.0,
+            step=0.5,
+            help="Discount rate used to compute NPV of monthly profits and the terminal resale.",
+            key="roi_discount_rate"
+        )
+        r_month = float(discount_rate) / 100.0 / 12.0
+        months = int(horizon_months)
+        if months > 0:
+            npv = -float(upfront_investment)
+            for m in range(1, months + 1):
+                denom = (1.0 + r_month) ** m if r_month > 0 else 1.0
+                npv += float(profit_monthly) / denom
+            if terminal_inflow > 0:
+                denom_end = (1.0 + r_month) ** months if r_month > 0 else 1.0
+                npv += float(terminal_inflow) / denom_end
+            st.metric("NPV", f"{simbolo_base} {npv:,.2f}".replace(",", ""))
+        else:
+            st.info("Set a valid horizon to compute NPV.")
 #
 # ---------------------------------------------------------
 # Helpers: Unit cost breakdown rendering (robust + readable)
@@ -1065,6 +1937,39 @@ def render_cost_tab():
             step=1,
             help="Useful life in months. The app converts this into an hourly and per-piece depreciation cost."
         )
+
+        st.markdown("**Residual / Resale value (optional)**")
+        resale_currency = st.selectbox(
+            "Resale value currency",
+            ["USD", "BRL"],
+            index=0 if moeda_base == "USD" else 1,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Expected resale value at the end of the depreciation period. This reduces the depreciable base."
+        )
+        resale_value_raw = st.number_input(
+            "Expected resale value",
+            value=0.0,
+            step=1000.0,
+            help="If you plan to sell the machine later, enter the expected resale price (in the selected currency)."
+        )
+
+        # Convert resale value to base currency (USD/BRL)
+        if resale_currency != moeda_base:
+            if dolar <= 0:
+                st.warning("Invalid USD/BRL rate. Resale value will be used as entered.")
+                residual_value = float(resale_value_raw)
+            else:
+                if resale_currency == "USD" and moeda_base == "BRL":
+                    residual_value = float(resale_value_raw) * float(dolar)
+                elif resale_currency == "BRL" and moeda_base == "USD":
+                    residual_value = float(resale_value_raw) / float(dolar)
+                else:
+                    residual_value = float(resale_value_raw)
+        else:
+            residual_value = float(resale_value_raw)
+
+        st.caption(f"Resale value in base currency: {simbolo_base} {residual_value:,.0f}".replace(",", ""))
+        st.caption(f"Depreciable base: {simbolo_base} {max(machine_value - residual_value, 0.0):,.0f}".replace(",", ""))
     with col_blank:
         st.subheader("5. Blank T-shirt")
         tshirt_cost = st.number_input(
@@ -1564,7 +2469,7 @@ def render_cost_tab():
             min_value=0.0,
             value=0.0,
             step=1.0,
-            help="Optional: replace calculated print time with a measured total (before setup). Handy when you time multiple passes manually (e.g., 3 cycles × 23 min)."
+            help="Optional: replace calculated print time with a measured total (before setup). If lower than speed implies, the app keeps the minimum based on speed."
         )
 
     st.markdown("#### Curing model (per pass)")
@@ -1655,6 +2560,7 @@ def render_cost_tab():
             consumo_forno_kw,
             machine_value,
             dep_months,
+            residual_value,
             tshirt_cost,
             service_monthly_total,
             platform_monthly_fee,
@@ -1690,6 +2596,8 @@ def render_cost_tab():
             "order_qty": qtd,
             "result": res,
             "machine_value": machine_value,
+            "residual_value": residual_value,
+            "dep_months": dep_months,
             "press_value": press_value,
             "press_enabled": press_enabled,
         }
@@ -1780,6 +2688,27 @@ def render_cost_tab():
 
                 df_job = df_job[["Item", "Per piece", "Total (job)"]]
                 st.dataframe(df_job, use_container_width=True, height=300)
+
+                # Minimal cards: cost share by item (per piece)
+                df_share = df_break.copy()
+                total_cost = float(df_share["Cost"].sum()) if not df_share.empty else 0.0
+                if total_cost > 0:
+                    df_share["Percent"] = (df_share["Cost"] / total_cost) * 100.0
+                    st.markdown("#### Cost share (per piece)")
+
+                    cards_per_row = 4
+                    rows = [
+                        df_share.iloc[i:i + cards_per_row]
+                        for i in range(0, len(df_share), cards_per_row)
+                    ]
+                    for row in rows:
+                        cols = st.columns(cards_per_row, gap="large")
+                        for idx, (_, r) in enumerate(row.iterrows()):
+                            item = str(r.get("Item", ""))
+                            cost = _safe_float(r.get("Cost", 0.0))
+                            pct = _safe_float(r.get("Percent", 0.0))
+                            with cols[idx]:
+                                st.metric(item, f"{pct:.1f}%", _fmt_money(simbolo_base, cost))
             else:
                 st.info("No breakdown available yet. Run a calculation first.")
 
