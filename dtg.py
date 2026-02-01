@@ -42,14 +42,23 @@ def extrair_consumo_de_imagem(uploaded_file):
         return None, f"Could not open file: {exc}"
 
     meta_textos = []
-    # Captura metadados conhecidos
-    if hasattr(img, "info"):
-        meta_textos.extend([str(v) for v in img.info.values() if v])
-    if hasattr(img, "text"):
-        meta_textos.extend([str(v) for v in img.text.values() if v])
+    # Captura metadados conhecidos (evita alertas do Pylance)
     try:
-        if hasattr(img, "tag_v2"):
-            meta_textos.extend([str(v) for v in img.tag_v2.values() if v])
+        info = getattr(img, "info", None)
+        if isinstance(info, dict):
+            meta_textos.extend([str(v) for v in info.values() if v])
+    except Exception:
+        pass
+    try:
+        text = getattr(img, "text", None)
+        if isinstance(text, dict):
+            meta_textos.extend([str(v) for v in text.values() if v])
+    except Exception:
+        pass
+    try:
+        tag_v2 = getattr(img, "tag_v2", None)
+        if isinstance(tag_v2, dict):
+            meta_textos.extend([str(v) for v in tag_v2.values() if v])
     except Exception:
         pass
     
@@ -319,12 +328,234 @@ def extrair_consumo_de_imagem(uploaded_file):
         "(e.g., 'Total C', 'Total W', 'Total Q') or use the Manual mode."
         + (f" Preview: '{preview_text[:180]}...'" if preview_text else "")
     )
+# ---------------------------------------------------------
+# Helper: Extract ink + time from Job Consumption spreadsheet (XLSX)
+# ---------------------------------------------------------
 
+def _parse_hms_to_seconds(v) -> float:
+    """Parse time-like values (HH:MM:SS.xxx) into seconds."""
+    import datetime as _dt
+
+    if v is None:
+        return 0.0
+    try:
+        if pd.isna(v):
+            return 0.0
+    except Exception:
+        pass
+
+    if isinstance(v, (int, float)):
+        if v <= 0:
+            return 0.0
+        # Excel time serials (fraction of day)
+        if 0 < v < 1.0:
+            return float(v) * 86400.0
+        # Assume minutes for small numeric values (common in exports)
+        if 1.0 <= v < 1000.0:
+            return float(v) * 60.0
+        # Fallback: treat as seconds
+        return float(v)
+    if isinstance(v, pd.Timedelta):
+        return float(v.total_seconds())
+    if isinstance(v, _dt.time):
+        return float(v.hour * 3600 + v.minute * 60 + v.second + (v.microsecond / 1e6))
+    if isinstance(v, _dt.datetime):
+        return float(v.hour * 3600 + v.minute * 60 + v.second + (v.microsecond / 1e6))
+
+    s = str(v).strip()
+    if not s:
+        return 0.0
+
+    # Numeric string (e.g., "0.001", "11.223")
+    if re.match(r"^\s*\d+(?:[.,]\d+)?\s*$", s):
+        try:
+            val = float(s.replace(",", "."))
+            return _parse_hms_to_seconds(val)
+        except Exception:
+            pass
+
+    try:
+        return float(pd.to_timedelta(s).total_seconds())
+    except Exception:
+        m = re.match(r"^\s*(\d+):(\d+):(\d+)(?:[.,](\d+))?\s*$", s)
+        if not m:
+            return 0.0
+        h = int(m.group(1))
+        mi = int(m.group(2))
+        se = int(m.group(3))
+        frac = (m.group(4) or "0")[:6].ljust(6, "0")
+        return float(h * 3600 + mi * 60 + se + (int(frac) / 1e6))
+
+
+def _format_seconds_hms(seconds: float) -> str:
+    try:
+        total = int(round(float(seconds)))
+    except Exception:
+        return "00:00:00"
+    if total < 0:
+        total = 0
+    hours = total // 3600
+    minutes = (total % 3600) // 60
+    secs = total % 60
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def extrair_consumo_de_planilha(uploaded_file):
+    """Read Kornit Job Consumption XLSX exports and return (df, cols, error)."""
+
+    def _clean_col(c):
+        return re.sub(r"\s+", " ", str(c)).strip()
+
+    try:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        raw = pd.read_excel(uploaded_file, header=None)
+    except Exception as exc:
+        return None, None, f"Could not read spreadsheet: {exc}"
+
+    # Find the header row containing the "Job Name" column
+    header_row = None
+    max_scan = min(80, len(raw))
+    for i in range(max_scan):
+        try:
+            row_vals = [str(v).strip().lower() for v in raw.iloc[i].tolist()]
+        except Exception:
+            continue
+        if any(v == "job name" for v in row_vals):
+            header_row = i
+            break
+
+    try:
+        if hasattr(uploaded_file, "seek"):
+            uploaded_file.seek(0)
+        if header_row is not None:
+            df = pd.read_excel(uploaded_file, header=header_row)
+        else:
+            df = pd.read_excel(uploaded_file)
+    except Exception as exc:
+        return None, None, f"Could not parse spreadsheet headers: {exc}"
+
+    df.columns = [_clean_col(c) for c in df.columns]
+    df = df.dropna(how="all")
+
+    def _find_col(needles):
+        for c in df.columns:
+            cl = str(c).lower()
+            for n in needles:
+                if n in cl:
+                    return c
+        return None
+
+    job_col = _find_col(["job name"])
+    job_fallback = False
+    if not job_col:
+        if len(df.columns) == 0:
+            return None, None, "Spreadsheet has no columns to parse."
+        job_col = df.columns[0]
+        job_fallback = True
+
+    cols = {
+        "job": job_col,
+        "job_fallback": job_fallback,
+        "len": _find_col(["job length", "# of imp", "of imp", "impressions"]),
+        "color": _find_col(["total color"]),
+        "white": _find_col(["total white"]),
+        "enh": _find_col(["total enhancers", "enhancers"]),
+        "time": _find_col(["printing time", "total printing"]),
+        "img_h": _find_col(["image height"]),
+        "img_w": _find_col(["image width"]),
+        "date": _find_col(["job start date"]),
+    }
+
+    df = df[df[cols["job"]].notna()].copy()
+    df[cols["job"]] = df[cols["job"]].astype(str).str.strip()
+
+    return df, cols, None
+
+
+def agregar_consumo_por_linhas(df: pd.DataFrame, cols: dict, selected_rows: list[int]):
+    """Aggregate totals for selected rows and return a per-piece consumption + time profile."""
+    if not selected_rows:
+        return None, "Select at least one row."
+
+    f = df.loc[selected_rows].copy()
+    if f.empty:
+        return None, "No rows matched the selected selection."
+
+    def _num(col):
+        if not col:
+            return pd.Series([0.0] * len(f), index=f.index)
+        return pd.to_numeric(f[col], errors="coerce").fillna(0.0)
+
+    total_color = float(_num(cols["color"]).sum())
+    total_white = float(_num(cols["white"]).sum())
+    total_enh = float(_num(cols["enh"]).sum())
+
+    if cols.get("len"):
+        job_len = float(_num(cols["len"]).sum())
+    else:
+        job_len = float(len(f))
+
+    if job_len <= 0:
+        job_len = float(len(f)) if len(f) > 0 else 1.0
+
+    total_time_sec = 0.0
+    if cols.get("time"):
+        for v in f[cols["time"]].tolist():
+            total_time_sec += _parse_hms_to_seconds(v)
+
+    img_h = 0.0
+    img_w = 0.0
+    if cols.get("img_h"):
+        h_vals = pd.to_numeric(f[cols["img_h"]], errors="coerce").dropna()
+        if not h_vals.empty:
+            img_h = float(h_vals.mean())
+    if cols.get("img_w"):
+        w_vals = pd.to_numeric(f[cols["img_w"]], errors="coerce").dropna()
+        if not w_vals.empty:
+            img_w = float(w_vals.mean())
+
+    # Convert to per-impression (ml / piece) + time per piece
+    c_per = total_color / job_len
+    w_per = total_white / job_len
+    q_per = total_enh / job_len
+    total_per = c_per + w_per + q_per
+
+    time_per_piece_min = (total_time_sec / job_len) / 60.0 if total_time_sec > 0 else 0.0
+
+    out = {
+        "cmyk_ml": float(c_per),
+        "white_ml": float(w_per),
+        "qfix_ml": float(q_per),
+        "total_ml": float(total_per),
+        "debug_matches": [{"campo": "Source", "valor": 0, "bruto": "XLSX"}],
+        "canais_consumo": [],
+        "sheet_totals": {
+            "Total Color (ml)": float(total_color),
+            "Total White (ml)": float(total_white),
+            "Total Enhancers (ml)": float(total_enh),
+            "Job Length": float(job_len),
+            "Total Printing Time (sec)": float(total_time_sec),
+            "Image Height (mm)": float(img_h),
+            "Image Width (mm)": float(img_w),
+        },
+        "sheet_time_per_piece_min": float(time_per_piece_min),
+        "sheet_img_h_mm": float(img_h),
+        "sheet_img_w_mm": float(img_w),
+    }
+
+    return out, None
 
 # ---------------------------------------------------------
 # Helper: Render CPP Ink Breakdown (wide, professional layout)
 # ---------------------------------------------------------
-def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: pd.DataFrame, desired_order: list[str]):
+def render_cpp_ink_breakdown(
+    consumo_file: dict,
+    df_s: pd.DataFrame,
+    totals_df: pd.DataFrame,
+    desired_order: list[str],
+    show_channels: bool = True
+):
     """Render CPP extracted ink breakdown in a wide, readable layout (safe Streamlit layout)."""
     total_c = float(consumo_file.get("cmyk_ml", 0.0))
     total_w = float(consumo_file.get("white_ml", 0.0))
@@ -358,7 +589,11 @@ def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: 
 
     st.markdown("")
 
-    col_chart1, col_chart2 = st.columns([1, 1], gap="large")
+    col_chart2 = None
+    if show_channels:
+        col_chart1, col_chart2 = st.columns([1, 1], gap="large")
+    else:
+        col_chart1, = st.columns([1], gap="large")
 
     with col_chart1:
         clean_height = 320
@@ -399,30 +634,31 @@ def render_cpp_ink_breakdown(consumo_file: dict, df_s: pd.DataFrame, totals_df: 
             use_container_width=True
         )
 
-    with col_chart2:
-        row_height = 28
-        chart_height = max(300, len(df_s) * row_height)
+    if show_channels and col_chart2 is not None:
+        with col_chart2:
+            row_height = 28
+            chart_height = max(300, len(df_s) * row_height)
 
-        chart_canais = (
-            alt.Chart(df_s)
-            .mark_bar(size=22, cornerRadius=10)
-            .encode(
-                x=alt.X("valor:Q", title="ml/piece"),
-                y=alt.Y(
-                    "canal:N",
-                    sort=desired_order,
-                    title=None,
-                    axis=alt.Axis(labelFontSize=12, labelPadding=4),
-                ),
-                color=alt.Color("cor:N", scale=None, legend=None),
-                tooltip=["canal", alt.Tooltip("valor", format=".2f")],
+            chart_canais = (
+                alt.Chart(df_s)
+                .mark_bar(size=22, cornerRadius=10)
+                .encode(
+                    x=alt.X("valor:Q", title="ml/piece"),
+                    y=alt.Y(
+                        "canal:N",
+                        sort=desired_order,
+                        title=None,
+                        axis=alt.Axis(labelFontSize=12, labelPadding=4),
+                    ),
+                    color=alt.Color("cor:N", scale=None, legend=None),
+                    tooltip=["canal", alt.Tooltip("valor", format=".2f")],
+                )
+                .properties(height=chart_height)
+                .configure_view(stroke=None)
+                .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
             )
-            .properties(height=chart_height)
-            .configure_view(stroke=None)
-            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
-        )
 
-        st.altair_chart(chart_canais, use_container_width=True)
+            st.altair_chart(chart_canais, use_container_width=True)
 
 def calcular_custo_total(
     qtd_pedido,
@@ -436,6 +672,7 @@ def calcular_custo_total(
     preco_tinta_litro,
     moeda_tinta,
     preco_tinta_ml_manual,
+    fixation_price_ml_manual,
     consumo_override,
     fixation_percent,
     custo_energia_kwh,
@@ -523,7 +760,7 @@ def calcular_custo_total(
         if float(tempo_impressao_min) < (0.90 * float(min_expected_min)):
             tempo_impressao_min = float(min_expected_min)
 
-    # Curing time (minutes) — batch curing per pass
+    # Curing time (minutes) — batch or fixed per pass
     tempo_cura_min = 0.0
     if curing_model == "batch_per_pass":
         bs = int(dryer_batch_size) if dryer_batch_size and int(dryer_batch_size) > 0 else 1
@@ -532,6 +769,9 @@ def calcular_custo_total(
 
         cycles_per_pass = int(math.ceil(float(qtd_pedido) / float(bs))) if qtd_pedido > 0 else 0
         tempo_cura_min = float(passes) * float(cycles_per_pass) * float(ct + ch)
+    elif curing_model == "fixed_per_pass":
+        ct = float(cure_time_min) if cure_time_min and float(cure_time_min) > 0 else 0.0
+        tempo_cura_min = float(passes) * float(ct)
 
     # Total job time
     tempo_total_min = float(tempo_impressao_min) + float(setup_min) + float(tempo_cura_min)
@@ -566,7 +806,13 @@ def calcular_custo_total(
         preco_litro_base = converter_para_base(preco_tinta_litro, moeda_tinta)
         if preco_litro_base is None: return "Error: invalid FX rate."
         custo_tinta_ml_base = preco_litro_base / 1000
-    custo_tinta_unit = consumo_ml_total * custo_tinta_ml_base
+
+    if fixation_price_ml_manual is None or float(fixation_price_ml_manual) <= 0:
+        custo_fix_ml_base = custo_tinta_ml_base
+    else:
+        custo_fix_ml_base = float(fixation_price_ml_manual)
+
+    custo_tinta_unit = (consumo_ml * custo_tinta_ml_base) + (fix_ml * custo_fix_ml_base)
     
     # -------------------------------------------------
     # Energy model
@@ -578,7 +824,7 @@ def calcular_custo_total(
     printer_hours_job = float(tempo_impressao_min) / 60.0
     dryer_hours_job = float(tempo_cura_min) / 60.0
 
-    if curing_model == "batch_per_pass":
+    if curing_model in ("batch_per_pass", "fixed_per_pass"):
         kwh_printer_job = printer_hours_job * float(consumo_maquina_kw)
         kwh_dryer_job = dryer_hours_job * float(consumo_forno_kw)
         total_kwh_job = kwh_printer_job + kwh_dryer_job
@@ -706,6 +952,7 @@ def calcular_custo_total(
         "ml_white": consumo_override["white_ml"] if consumo_override else None,
         "ml_qfix": consumo_override["qfix_ml"] if consumo_override else None,
         "preco_tinta_ml_base": custo_tinta_ml_base, "preco_tinta_litro_base": preco_litro_base,
+        "preco_fix_ml_base": custo_fix_ml_base,
         "horas_mes": horas_mes,
         "custo_hora_equipe": custo_hora_equipe,
         "custo_hora_designer": custo_hora_designer,
@@ -784,7 +1031,8 @@ def render_roi_tab():
             help="Average dryer/curing unit power consumption during production.",
             key="roi_dryer_kw"
         )
-        st.caption(f"Estimated energy: {simbolo_base} {((consumo_maquina_kw+consumo_forno_kw)*kwh):.2f}/h")
+        est_energy = (consumo_maquina_kw + consumo_forno_kw) * kwh
+        st.caption(f"Estimated energy: {_fmt_money(simbolo_base, est_energy)}/h")
 
     with c_insumo:
         st.subheader("2. Ink Costs")
@@ -797,6 +1045,7 @@ def render_roi_tab():
         preco_tinta_ml_manual = None
         preco_tinta_litro = 0.0
         moeda_tinta = "USD"
+        ink_price_ml_est = None
         if modo_preco == "Per liter":
             moeda_tinta = st.selectbox(
                 "Liter currency",
@@ -812,6 +1061,13 @@ def render_roi_tab():
                 help="Ink price per liter in the selected liter currency.",
                 key="roi_ink_liter_price"
             )
+            if moeda_tinta == moeda_base:
+                ink_price_ml_est = float(preco_tinta_litro) / 1000.0
+            elif dolar > 0:
+                if moeda_tinta == "USD" and moeda_base == "BRL":
+                    ink_price_ml_est = (float(preco_tinta_litro) * float(dolar)) / 1000.0
+                elif moeda_tinta == "BRL" and moeda_base == "USD":
+                    ink_price_ml_est = (float(preco_tinta_litro) / float(dolar)) / 1000.0
         else:
             preco_tinta_ml_manual = st.number_input(
                 f"Ink price per ml ({simbolo_base})",
@@ -821,6 +1077,36 @@ def render_roi_tab():
                 help="Direct ink price per ml in the base currency.",
                 key="roi_ink_ml_price"
             )
+            ink_price_ml_est = float(preco_tinta_ml_manual)
+
+        fixation_liter_price = st.number_input(
+            "Fixation price per liter",
+            value=float(preco_tinta_litro or 0.0),
+            step=1.0,
+            help="Fixation price per liter in the selected currency. If left at 0, the app uses the same price as ink.",
+            key="roi_fixation_liter_price"
+        )
+        fixation_price_ml_manual = None
+        if fixation_liter_price and float(fixation_liter_price) > 0:
+            fixation_currency = moeda_tinta if modo_preco == "Per liter" else moeda_base
+            if fixation_currency == moeda_base:
+                fixation_price_ml_manual = float(fixation_liter_price) / 1000.0
+            elif dolar > 0:
+                if fixation_currency == "USD" and moeda_base == "BRL":
+                    fixation_price_ml_manual = (float(fixation_liter_price) * float(dolar)) / 1000.0
+                elif fixation_currency == "BRL" and moeda_base == "USD":
+                    fixation_price_ml_manual = (float(fixation_liter_price) / float(dolar)) / 1000.0
+        last_res = st.session_state.get("roi_last_res")
+        if isinstance(last_res, dict):
+            fix_ml = _safe_float(last_res.get("ml_fixation", 0.0))
+            fix_price_ml = _safe_float(last_res.get("preco_fix_ml_base", 0.0))
+            fix_cost = fix_ml * fix_price_ml
+            st.caption(f"Fixation price (per ml): {_fmt_money(simbolo_base, fix_price_ml)}")
+            st.caption(
+                f"Fixation (per piece): {_fmt_number(fix_ml, 2)} ml = {_fmt_money(simbolo_base, fix_cost)}"
+            )
+        else:
+            st.caption("Fixation cost (per piece) appears after calculation.")
 
     with c_team:
         st.subheader("3. Labor")
@@ -905,7 +1191,7 @@ def render_roi_tab():
         else:
             machine_value = float(machine_value_raw)
 
-        st.caption(f"Machine value in base currency: {simbolo_base} {machine_value:,.0f}".replace(",", ""))
+        st.caption(f"Machine value in base currency: {simbolo_base} {_fmt_number(machine_value, 0)}")
 
         dep_months = st.number_input(
             "Depreciation (months)",
@@ -946,8 +1232,8 @@ def render_roi_tab():
         else:
             residual_value = float(resale_value_raw)
 
-        st.caption(f"Resale value in base currency: {simbolo_base} {residual_value:,.0f}".replace(",", ""))
-        st.caption(f"Depreciable base: {simbolo_base} {max(machine_value - residual_value, 0.0):,.0f}".replace(",", ""))
+        st.caption(f"Resale value in base currency: {simbolo_base} {_fmt_number(residual_value, 0)}")
+        st.caption(f"Depreciable base: {simbolo_base} {_fmt_number(max(machine_value - residual_value, 0.0), 0)}")
 
     with col_blank:
         st.subheader("5. Blank T-shirt")
@@ -1126,157 +1412,26 @@ def render_roi_tab():
         extras_per_piece_total = float(per_piece_vals.fillna(0).sum()) if isinstance(per_piece_vals, pd.Series) else 0.0
 
     st.caption(
-        f"Custom adders totals → Monthly: {simbolo_base} {extras_monthly_total:.2f} | "
-        f"Per piece: {simbolo_base} {extras_per_piece_total:.2f}"
+        f"Custom adders totals → Monthly: {_fmt_money(simbolo_base, extras_monthly_total)} | "
+        f"Per piece: {_fmt_money(simbolo_base, extras_per_piece_total)}"
     )
 
     st.markdown("---")
-    st.markdown("### 7. Finishing Option: Heat Press (Optional)")
-
-    press_enabled = st.checkbox(
-        "Include heat press finishing",
-        value=False,
-        help=(
-            "Enable this if the client will finish the garment using a heat press after DTG printing. "
-            "The app will add extra labor time, press energy and press depreciation to the unit cost."
-        ),
-        key="roi_press_enabled"
-    )
-
-    press_use_same_labor = st.checkbox(
-        "Use same labor rate as printing",
-        value=True,
-        help=(
-            "When enabled, the heat press labor cost will use the same hourly rate calculated for the printing team. "
-            "Disable to use a dedicated heat press operator salary."
-        ),
-        key="roi_press_use_same_labor"
-    )
-
-    p1, p2, p3, p4, p5 = st.columns(5, gap="large")
-
-    with p1:
-        press_cycle_seconds = st.number_input(
-            "Press time per piece (seconds)",
-            min_value=0.0,
-            value=0.0,
-            step=1.0,
-            help="Average operator time to press one piece, in seconds. Used to calculate additional labor and energy for this finishing step.",
-            key="roi_press_cycle_seconds"
-        )
-
-    with p2:
-        press_kw = st.number_input(
-            "Heat press power (kW)",
-            min_value=0.0,
-            value=1.8,
-            step=0.1,
-            help="Average power consumption of the heat press during operation.",
-            key="roi_press_kw"
-        )
-
-    with p3:
-        press_currency = st.selectbox(
-            "Heat press value currency",
-            ["USD", "BRL"],
-            index=0 if moeda_base == "USD" else 1,
-            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
-            help="Currency of the heat press acquisition value. It will be converted to the base currency.",
-            key="roi_press_currency"
-        )
-
-    with p4:
-        press_value_raw = st.number_input(
-            "Heat press value",
-            min_value=0.0,
-            value=2000.0,
-            step=100.0,
-            help="Approximate acquisition value of the heat press in the selected currency.",
-            key="roi_press_value"
-        )
-
-    with p5:
-        press_operator_salary = st.number_input(
-            f"Press operator / month ({simbolo_base})",
-            min_value=0.0,
-            value=0.0,
-            step=100.0,
-            help=(
-                "Monthly base salary for a dedicated heat press operator. "
-                "Used only when 'Use same labor rate as printing' is disabled."
-            ),
-            key="roi_press_operator_salary"
-        )
-
-    if press_currency != moeda_base:
-        if dolar <= 0:
-            press_value = float(press_value_raw)
-            st.warning("Invalid USD/BRL rate. Heat press value will be used as entered.")
-        else:
-            if press_currency == "USD" and moeda_base == "BRL":
-                press_value = float(press_value_raw) * float(dolar)
-            elif press_currency == "BRL" and moeda_base == "USD":
-                press_value = float(press_value_raw) / float(dolar)
-            else:
-                press_value = float(press_value_raw)
-    else:
-        press_value = float(press_value_raw)
-
-    press_dep_months = st.number_input(
-        "Heat press depreciation (months)",
-        min_value=1,
-        value=36,
-        step=1,
-        help="Useful life in months for the heat press. Converted to an hourly and per-piece cost when enabled.",
-        key="roi_press_dep_months"
-    )
-
-    if press_enabled:
-        st.caption(
-            f"Heat press value in base currency: {simbolo_base} {press_value:,.0f}".replace(",", "")
-        )
-    if press_enabled and not press_use_same_labor:
-        st.caption("Dedicated press labor rate will be used for the heat press step.")
-        est_press_custo_hora = (
-            (float(press_operator_salary) * (1 + float(encargos)) / float(horas_mes))
-            if float(horas_mes) > 0 else 0.0
-        )
-        st.caption(f"Estimated dedicated press labor rate: {simbolo_base} {est_press_custo_hora:.2f}/h")
-
-    st.markdown("---")
-    st.subheader("📦 Order Data")
-    st.caption("Fill the order details and choose how ink consumption will be defined for this ROI.")
+    st.markdown("### 7. Ink consumption (ROI)")
+    st.caption("Define the ink profile used for ROI. This is not tied to a specific order.")
 
     calc_mode = st.session_state.get("roi_calc_mode")
     consumo_override = st.session_state.get("roi_consumo_override")
     consumo_file = st.session_state.get("roi_consumo_file")
     erro_file = None
 
-    od1, od2, od3 = st.columns(3, gap="large")
-    with od1:
-        qtd = st.number_input(
-            "Quantity",
-            value=1000,
-            step=50,
-            help="Current order quantity for this ROI scenario.",
-            key="roi_qty"
-        )
-    with od2:
-        complexidade = st.selectbox(
-            "Print complexity",
-            list(FATORES_COMPLEXIDADE.keys()),
-            1,
-            help="Defines default ink consumption and a speed factor when using the Default consumption mode.",
-            key="roi_complexity"
-        )
-    with od3:
-        fixation_percent = st.number_input(
-            "Fixation (%)",
-            value=10.0,
-            step=0.5,
-            help="Fixation is calculated as a percentage of ink consumption.",
-            key="roi_fixation_percent"
-        )
+    fixation_percent = st.number_input(
+        "Fixation (%)",
+        value=10.0,
+        step=0.5,
+        help="Fixation is calculated as a percentage of ink consumption.",
+        key="roi_fixation_percent"
+    )
 
     st.markdown("#### Consumption source")
     st.info(
@@ -1285,9 +1440,16 @@ def render_roi_tab():
         "• Manual: you type CMYK/White/Qfix ml per piece.\n"
         "• File (PNG/TIFF): the app extracts Total C/W/Q from a CPP export (with OCR fallback)."
     )
-    tab_p, tab_m, tab_a = st.tabs(["Default", "Manual", "File (PNG/TIFF)"])
+    tab_p, tab_m, tab_a, tab_s = st.tabs(["Default", "Manual", "File (PNG/TIFF)", "Spreadsheet (XLSX)"])
 
     with tab_p:
+        complexidade = st.selectbox(
+            "Print complexity",
+            list(FATORES_COMPLEXIDADE.keys()),
+            1,
+            help="Defines default ink consumption and a speed factor when using the Default consumption mode.",
+            key="roi_complexity"
+        )
         st.info("Uses the default consumption for the selected complexity.")
         if st.button("Calculate (Default)", type="primary", key="roi_calc_p"):
             st.session_state["roi_calc_mode"] = "padrao"
@@ -1338,11 +1500,19 @@ def render_roi_tab():
                 total_w = sum(c["white_ml"] for _, c in consumos)
                 total_q = sum(c["qfix_ml"] for _, c in consumos)
                 total_all = sum(c["total_ml"] for _, c in consumos)
+                canais_sum = {}
+
+                for _, c in consumos:
+                    for canal in c.get("canais_consumo", []) or []:
+                        canal_nome = canal.get("canal")
+                        valor = float(canal.get("valor", 0.0))
+                        if canal_nome:
+                            canais_sum[canal_nome] = canais_sum.get(canal_nome, 0.0) + valor
 
                 st.success(
-                    f"Summed {len(consumos)} file(s): CMYK={total_c:.2f} ml, "
-                    f"White={total_w:.2f} ml, Qfix={total_q:.2f} ml "
-                    f"(Total {total_all:.2f} ml/piece)."
+                    f"Summed {len(consumos)} file(s): CMYK={_fmt_number(total_c, 2)} ml, "
+                    f"White={_fmt_number(total_w, 2)} ml, Qfix={_fmt_number(total_q, 2)} ml "
+                    f"(Total {_fmt_number(total_all, 2)} ml/piece)."
                 )
                 if erros:
                     st.warning("Some files were skipped: " + " | ".join(erros))
@@ -1352,10 +1522,45 @@ def render_roi_tab():
                     "white_ml": total_w,
                     "qfix_ml": total_q,
                     "total_ml": total_all,
-                    "canais_consumo": [],
+                    "canais_consumo": [{"canal": k, "valor": v} for k, v in canais_sum.items()],
                     "debug_matches": [],
                 }
                 st.session_state["roi_consumo_file"] = consumo_file_agg
+
+                color_map = {
+                    "C": "#00bcd4", "M": "#d500f9", "Y": "#ffeb3b", "K": "#212121",
+                    "R": "#f44336", "G": "#4caf50",
+                    "W": "#e0e0e0", "Qc": "#29b6f6", "Qw": "#81d4fa",
+                    "Ny": "#ce93d8", "Np": "#bcaaa4", "PE": "#9575cd", "PG": "#66bb6a"
+                }
+                desired_order = ["C", "M", "Y", "K", "R", "G", "Np", "Ny", "Qc", "PE", "W", "Qw", "PG"]
+
+                df_s = pd.DataFrame(consumo_file_agg.get("canais_consumo", []))
+                present = set(df_s["canal"].tolist()) if not df_s.empty else set()
+                for canal in desired_order:
+                    if canal not in present:
+                        df_s = pd.concat([df_s, pd.DataFrame([{"canal": canal, "valor": 0}])], ignore_index=True)
+
+                df_s["canal"] = pd.Categorical(df_s["canal"], categories=desired_order, ordered=True)
+                df_s = df_s.sort_values("canal")
+
+                color_series = df_s["canal"].map(color_map).astype(object)
+                df_s["cor"] = color_series.where(color_series.notna(), "#9e9e9e")
+
+                totals_df = pd.DataFrame([
+                    {"campo": "Total C", "valor": total_c, "hex": "#64b5f6"},
+                    {"campo": "Total W", "valor": total_w, "hex": "#1976d2"},
+                    {"campo": "Total Q", "valor": total_q, "hex": "#42a5f5"},
+                    {"campo": "Total (overall)", "valor": total_all, "hex": "#b3e5fc"},
+                ])
+
+                render_cpp_ink_breakdown(
+                    consumo_file_agg,
+                    df_s,
+                    totals_df,
+                    desired_order,
+                    show_channels=False,
+                )
 
         if st.button("Calculate (File)", type="primary", key="roi_calc_a"):
             if st.session_state.get("roi_consumo_file") is None:
@@ -1400,71 +1605,52 @@ def render_roi_tab():
             key="roi_print_passes"
         )
     with mp2:
+        # If using spreadsheet-based consumption, auto-suggest total print time
+        if st.session_state.get("calc_mode") == "planilha":
+            tpp = _safe_float(st.session_state.get("sheet_time_per_piece_min", 0.0))
+            qtd_preview = _safe_float(st.session_state.get("roi_monthly_volume", 0.0))
+            if tpp > 0 and float(qtd_preview) > 0:
+                suggested_total = float(tpp) * float(qtd_preview) * float(print_passes)
+                if _safe_float(st.session_state.get("custom_print_time_min", 0.0)) <= 0:
+                    st.session_state["custom_print_time_min"] = suggested_total
+                st.caption(
+                    f"From spreadsheet: {_fmt_number(tpp, 2)} min/piece → suggested total print time = "
+                    f"{_fmt_number(suggested_total, 1)} min (qty × passes)."
+                )
+
         custom_print_time_min = st.number_input(
             "Override total print time (min)",
             min_value=0.0,
-            value=0.0,
+            value=_safe_float(st.session_state.get("custom_print_time_min", 0.0)),
             step=1.0,
             help="Optional: replace calculated print time with a measured total (before setup). If lower than speed implies, the app keeps the minimum based on speed.",
-            key="roi_custom_print_time_min"
+            key="custom_print_time_min",
         )
 
-    st.markdown("#### Curing model (per pass)")
-
-    curing_model = st.selectbox(
-        "Curing time model",
-        options=["Legacy (included in job time)", "Batch curing per pass (front/back/label)"],
-        index=0,
-        help=(
-            "Legacy: keeps current behavior (dryer energy/time considered across the whole job time).\n"
-            "Batch curing per pass: adds curing time as batches for EACH print pass (front/back/label)."
-        ),
-        key="roi_curing_model"
+    st.markdown("#### Volume assumption")
+    monthly_volume = st.number_input(
+        "Expected monthly volume (pcs)",
+        min_value=1,
+        value=1000,
+        step=100,
+        help="Reference monthly volume used for the ROI cost model and payback analysis.",
+        key="roi_monthly_volume"
     )
 
-    curing_model_key = "batch_per_pass" if curing_model.startswith("Batch") else "legacy"
+    qtd = int(monthly_volume)
 
-    dryer_batch_size = 10
-    cure_time_min = 23.0
+    curing_model_key = "legacy"
+    dryer_batch_size = 1
+    cure_time_min = 0.0
     cure_handling_min = 0.0
 
-    if curing_model_key == "batch_per_pass":
-        ccu1, ccu2, ccu3 = st.columns(3, gap="large")
-        with ccu1:
-            dryer_batch_size = st.number_input(
-                "Dryer batch capacity (pcs)",
-                min_value=1,
-                value=10,
-                step=1,
-                help="How many T-shirts fit in ONE curing cycle (batch).",
-                key="roi_dryer_batch_size"
-            )
-        with ccu2:
-            cure_time_min = st.number_input(
-                "Cure time per batch (min)",
-                min_value=0.0,
-                value=23.0,
-                step=1.0,
-                help="Fixed curing time per batch (e.g., 23 minutes).",
-                key="roi_cure_time_min"
-            )
-        with ccu3:
-            cure_handling_min = st.number_input(
-                "Load/Unload add-on per batch (min)",
-                min_value=0.0,
-                value=0.0,
-                step=0.5,
-                help="Optional handling time per batch (loading/unloading/rack handling).",
-                key="roi_cure_handling_min"
-            )
-
-        import math
-        cycles_preview = int(math.ceil(float(qtd) / float(dryer_batch_size))) if qtd and dryer_batch_size else 0
-        total_cure_preview = float(print_passes) * float(cycles_preview) * float(cure_time_min + cure_handling_min)
-        st.caption(
-            f"Preview: {cycles_preview} batch(es) per pass × {int(print_passes)} pass(es) → "
-            f"{total_cure_preview:.1f} min curing time added."
-        )
+    press_enabled = False
+    press_cycle_seconds = 0.0
+    press_kw = 0.0
+    press_value = 0.0
+    press_dep_months = 1
+    press_use_same_labor = True
+    press_operator_salary = 0.0
 
     calc_mode = st.session_state.get("roi_calc_mode")
     consumo_override = st.session_state.get("roi_consumo_override")
@@ -1479,6 +1665,25 @@ def render_roi_tab():
     calc_btn = calc_mode is not None
 
     if calc_btn:
+        if curing_model_key == "fixed_per_pass":
+            if not cure_time_min or float(cure_time_min) <= 0:
+                st.error("Cure time per pass must be greater than 0 for Fixed curing.")
+                return
+        if curing_model_key == "batch_per_pass":
+            if not dryer_batch_size or int(dryer_batch_size) <= 0:
+                st.error("Dryer batch capacity must be greater than 0 for Batch curing.")
+                return
+            if not cure_time_min or float(cure_time_min) <= 0:
+                st.error("Cure time per batch must be greater than 0 for Batch curing.")
+                return
+        if int(st.session_state.get("cost_print_passes", 1)) > 1:
+            if calc_mode in ("padrao", "manual"):
+                st.error(
+                    "Print passes > 1 require multiple consumption sources. "
+                    "Use File (PNG/TIFF) or Spreadsheet (XLSX) and provide one file/row per pass."
+                )
+                return
+
         res = calcular_custo_total(
             qtd,
             vel_nominal,
@@ -1491,6 +1696,7 @@ def render_roi_tab():
             preco_tinta_litro,
             moeda_tinta,
             preco_tinta_ml_manual,
+            fixation_price_ml_manual,
             consumo_override,
             fixation_percent,
             kwh,
@@ -1528,10 +1734,114 @@ def render_roi_tab():
         if isinstance(res, str):
             st.error(res)
             return
+        st.session_state["roi_last_res"] = res
         unit_cost = float(res["custo_final_unit"])
     else:
         st.info("Choose a consumption source and click Calculate to enable ROI.")
         return
+
+    st.markdown("#### Cost summary (fixed vs variable)")
+    ink_price_ml = _safe_float(res.get("preco_tinta_ml_base", 0.0))
+    ink_base_ml = _safe_float(res.get("ml_base", 0.0))
+    ink_fix_ml = _safe_float(res.get("ml_fixation", 0.0))
+    fix_price_ml = _safe_float(res.get("preco_fix_ml_base", 0.0))
+    ink_base_cost = ink_base_ml * ink_price_ml
+    ink_fix_cost = ink_fix_ml * fix_price_ml
+
+    monthly_volume_float = float(monthly_volume) if monthly_volume and float(monthly_volume) > 0 else 1.0
+
+    fixed_components = {
+        "Labor (monthly)": (float(sal_op) + float(sal_aj)) * (1 + float(encargos)) / monthly_volume_float,
+        "Design (monthly)": (
+            (float(sal_designer) * (1 + float(encargos))) / monthly_volume_float
+            if float(sal_designer) > 0 else 0.0
+        ),
+        "Depreciation (monthly)": (float(machine_value) / float(dep_months) / monthly_volume_float)
+        if dep_months and float(dep_months) > 0 else 0.0,
+        "Service (monthly)": float(service_monthly_total) / monthly_volume_float,
+        "Platform (monthly)": float(platform_monthly_fee) / monthly_volume_float,
+    }
+    variable_components = {
+        "Ink (base)": ink_base_cost,
+        "Fixation (ink)": ink_fix_cost,
+        "Energy": res.get("custo_energia_unit", 0.0),
+        "T-shirt": res.get("custo_tshirt_unit", 0.0),
+        "Platform fee (per piece)": res.get("custo_platform_unit_var", 0.0),
+    }
+    extras_fixed_sum = 0.0
+    extras_var_sum = 0.0
+
+    if isinstance(extras_df, pd.DataFrame) and not extras_df.empty:
+        for _, row in extras_df.iterrows():
+            desc = str(row.get("Description", "")).strip() or "Extra"
+            item_type = str(row.get("Type", "")).strip()
+            raw_amount = pd.to_numeric(row.get("Amount", 0.0), errors="coerce")
+            if pd.isna(raw_amount):
+                continue
+            amount = float(raw_amount)
+            if amount <= 0:
+                continue
+            if item_type == "Monthly":
+                per_unit = amount / monthly_volume_float
+                fixed_components[f"{desc} (monthly)"] = per_unit
+                extras_fixed_sum += per_unit
+            elif item_type == "Per piece":
+                variable_components[f"{desc} (per piece)"] = amount
+                extras_var_sum += amount
+
+    if extras_fixed_sum > 0:
+        fixed_components["Extras subtotal (monthly)"] = extras_fixed_sum
+    if extras_var_sum > 0:
+        variable_components["Extras subtotal (per piece)"] = extras_var_sum
+
+    fixed_unit = float(sum(fixed_components.values()))
+    variable_unit = float(sum(variable_components.values()))
+    total_unit = fixed_unit + variable_unit
+
+    f1, f2, f3 = st.columns(3, gap="large")
+    f1.metric("Fixed cost per unit", _fmt_money(simbolo_base, fixed_unit))
+    f2.metric("Variable cost per unit", _fmt_money(simbolo_base, variable_unit))
+    f3.metric("Total cost per unit", _fmt_money(simbolo_base, total_unit))
+
+    cf, cv = st.columns(2, gap="large")
+    with cf:
+        st.markdown("**Fixed cost details (per unit)**")
+        for label, val in fixed_components.items():
+            bg = "#fff3d6" if "Extras subtotal" in label else "#eef3ff"
+            _render_cost_label(label, _fmt_money(simbolo_base, val), bg)
+        _render_cost_label("Total fixed", _fmt_money(simbolo_base, fixed_unit), "#dbe7ff")
+    with cv:
+        st.markdown("**Variable cost details (per unit)**")
+        for label, val in variable_components.items():
+            bg = "#fff3d6" if "Extras subtotal" in label else "#f1f7f2"
+            _render_cost_label(label, _fmt_money(simbolo_base, val), bg)
+        _render_cost_label("Total variable", _fmt_money(simbolo_base, variable_unit), "#deefe0")
+
+    _render_cost_label(
+        "Total cost (fixed + variable)",
+        _fmt_money(simbolo_base, total_unit),
+        "#f7f1e8",
+    )
+
+    breakdown_rows = [
+        {"Item": k, "Cost": float(v)}
+        for k, v in {**fixed_components, **variable_components}.items()
+        if float(v) > 0
+    ]
+    if breakdown_rows:
+        df_breakdown = pd.DataFrame(breakdown_rows).sort_values("Cost", ascending=False)
+        chart_breakdown = (
+            alt.Chart(df_breakdown)
+            .mark_bar(size=28, cornerRadius=6)
+            .encode(
+                x=alt.X("Cost:Q", title=f"Cost per unit ({simbolo_base})"),
+                y=alt.Y("Item:N", sort="-x", title=None),
+                tooltip=[alt.Tooltip("Item:N"), alt.Tooltip("Cost:Q", format=".4f")],
+            )
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+        )
+        st.altair_chart(chart_breakdown, use_container_width=True)
 
     st.markdown("#### ROI setup")
     default_price = unit_cost * 1.30 if unit_cost > 0 else 0.0
@@ -1548,26 +1858,19 @@ def render_roi_tab():
         )
         unit_margin = selling_price - unit_cost
         margin_pct = (unit_margin / unit_cost * 100) if unit_cost > 0 else 0.0
-        st.metric("Unit margin", f"{simbolo_base} {unit_margin:.2f}", f"{margin_pct:.1f}% over cost")
+        st.metric("Unit margin", _fmt_money(simbolo_base, unit_margin), f"{margin_pct:.1f}% over cost")
+        st.caption(f"Gain on price: {margin_pct:.1f}%")
 
     with c2:
-        monthly_volume = st.number_input(
-            "Expected monthly volume (pcs)",
-            min_value=1,
-            value=int(qtd),
-            step=100,
-            help="Expected sales volume per month used for payback and ROI.",
-            key="roi_monthly_volume"
-        )
-        st.metric("Monthly revenue", f"{simbolo_base} {selling_price * monthly_volume:,.2f}".replace(",", ""))
+        st.metric("Monthly revenue", _fmt_money(simbolo_base, selling_price * monthly_volume))
 
     with c3:
         upfront_investment = st.number_input(
-            f"Total upfront investment ({simbolo_base})",
+            f"Investimento inicial total ({simbolo_base})",
             min_value=0.0,
             value=0.0,
             step=1000.0,
-            help="Sum of equipment and other upfront costs you want to recover.",
+            help="Soma dos equipamentos e outros custos iniciais que voce deseja recuperar.",
             key="roi_upfront_investment"
         )
         monthly_extra = st.number_input(
@@ -1578,6 +1881,20 @@ def render_roi_tab():
             help="Optional: costs not embedded in the unit cost that should be discounted from monthly profit.",
             key="roi_monthly_extra"
         )
+
+    st.markdown("#### Suggested prices and margins")
+    suggested_margins = [10, 20, 30, 40, 50]
+    suggestions = []
+    for m in suggested_margins:
+        price = unit_cost * (1 + (m / 100))
+        suggestions.append(
+            {
+                "Margin over cost (%)": f"{m}%",
+                f"Suggested price ({simbolo_base})": _fmt_money(simbolo_base, price),
+                f"Unit margin ({simbolo_base})": _fmt_money(simbolo_base, price - unit_cost),
+            }
+        )
+    st.dataframe(pd.DataFrame(suggestions), use_container_width=True, hide_index=True)
 
     st.markdown("#### Resale value (optional)")
     st.caption("Use this only if you realistically expect to sell the equipment. Keep it at 0 for a conservative view.")
@@ -1614,6 +1931,18 @@ def render_roi_tab():
         "If you want to test an optimistic scenario, enter a resale value and use Terminal cash inflow + NPV."
     )
 
+    fixed_monthly_total = (
+        (float(sal_op) + float(sal_aj) + float(sal_designer)) * (1 + float(encargos))
+        + (float(machine_value) / float(dep_months) if dep_months and float(dep_months) > 0 else 0.0)
+        + float(service_monthly_total)
+        + float(platform_monthly_fee)
+        + float(extras_monthly_total)
+        + float(monthly_extra)
+    )
+    fixed_unit_rate = fixed_monthly_total / monthly_volume if monthly_volume and monthly_volume > 0 else 0.0
+    unit_cost_var = max(float(unit_cost) - float(fixed_unit_rate), 0.0)
+    unit_margin_fixed = selling_price - unit_cost_var
+
     profit_monthly = (unit_margin * monthly_volume) - monthly_extra
     use_net_investment = resale_treatment.startswith("Reduce")
     effective_investment = max(upfront_investment - resale_value, 0.0) if use_net_investment else upfront_investment
@@ -1633,13 +1962,13 @@ def render_roi_tab():
         )
 
     pieces_to_payback = (effective_investment / unit_margin) if unit_margin > 0 else None
-    breakeven_volume = (monthly_extra / unit_margin) if unit_margin > 0 else None
+    breakeven_volume = (fixed_monthly_total / unit_margin_fixed) if unit_margin_fixed > 0 else None
 
     st.markdown("---")
 
     m1, m2, m3, m4 = st.columns(4, gap="large")
-    m1.metric("Unit cost (ROI)", f"{simbolo_base} {unit_cost:.2f}")
-    m2.metric("Monthly profit", f"{simbolo_base} {profit_monthly:,.2f}".replace(",", ""))
+    m1.metric("Unit cost (ROI)", _fmt_money(simbolo_base, unit_cost))
+    m2.metric("Monthly profit", _fmt_money(simbolo_base, profit_monthly))
     m3.metric("Annual ROI", f"{annual_roi_pct:.1f}%")
 
     if payback_months:
@@ -1652,7 +1981,7 @@ def render_roi_tab():
     st.caption(f"ROI treatment: {resale_note}.")
     if resale_value > 0:
         st.caption(
-            f"Effective investment for ROI: {simbolo_base} {effective_investment:,.2f}".replace(",", "")
+            f"Effective investment for ROI: {_fmt_money(simbolo_base, effective_investment)}"
         )
 
     col_left, col_right = st.columns([1, 1], gap="large")
@@ -1662,24 +1991,89 @@ def render_roi_tab():
         if unit_margin <= 0:
             st.error("Selling price is not above unit cost. Increase price or reduce cost to compute ROI.")
         else:
-            st.write(
-                f"Minimum pieces to recover investment: "
-                f"**{pieces_to_payback:.0f} pcs**" if pieces_to_payback else "Pieces to recover: —"
+            has_payback = pieces_to_payback is not None
+            has_breakeven = breakeven_volume is not None
+
+            max_pieces = 0
+            if has_payback:
+                max_pieces = int(float(pieces_to_payback) * 1.4)
+            max_pieces = max(max_pieces, int(monthly_volume * 1.4), 100)
+            step = max(int(max_pieces / 60), 1)
+
+            chart_df = pd.DataFrame(
+                {
+                    "pieces": list(range(0, max_pieces + 1, step)),
+                }
             )
-            st.write(
-                f"Monthly volume to cover extra fixed costs: "
-                f"**{breakeven_volume:.0f} pcs/month**" if breakeven_volume else "Breakeven volume: —"
+            chart_df["revenue"] = chart_df["pieces"] * float(selling_price)
+            chart_df["total_cost"] = (chart_df["pieces"] * float(unit_cost_var)) + float(fixed_monthly_total)
+
+            chart_long = chart_df.melt("pieces", var_name="series", value_name="value")
+            chart_long["series"] = chart_long["series"].map(
+                {"revenue": "Revenue", "total_cost": "Total cost"}
             )
-            if use_net_investment:
-                st.caption("Breakeven ignores investment; payback pieces use net investment (after resale).")
+
+            line = (
+                alt.Chart(chart_long)
+                .mark_line(strokeWidth=3)
+                .encode(
+                    x=alt.X("pieces:Q", title="Pieces"),
+                    y=alt.Y("value:Q", title=f"Amount ({simbolo_base})"),
+                    color=alt.Color("series:N", legend=alt.Legend(title=None)),
+                    tooltip=[
+                        alt.Tooltip("pieces:Q", title="Pieces"),
+                        alt.Tooltip("series:N", title="Series"),
+                        alt.Tooltip("value:Q", title="Amount", format=".2f"),
+                    ],
+                )
+            )
+
+            if has_breakeven:
+                payback_df = pd.DataFrame(
+                    {
+                        "pieces": [float(breakeven_volume)],
+                        "value": [float(selling_price) * float(breakeven_volume)],
+                    }
+                )
+                payback_rule = alt.Chart(pd.DataFrame({"x": [float(breakeven_volume)]})).mark_rule(
+                    color="#d37f00",
+                    strokeDash=[6, 4]
+                ).encode(x="x:Q")
+                payback_point = (
+                    alt.Chart(payback_df)
+                    .mark_point(color="#d37f00", size=70, filled=True)
+                    .encode(x="pieces:Q", y="value:Q")
+                )
+                chart = line + payback_rule + payback_point
             else:
-                st.caption("Breakeven ignores investment; payback pieces ignore terminal resale.")
+                chart = line
+
+            st.altair_chart(chart.configure_view(stroke=None), use_container_width=True)
+
+            st.markdown("")
+            b1, b2, b3, b4 = st.columns(4, gap="large")
+            with b1:
+                label_payback = f"{float(pieces_to_payback):.0f} pcs" if has_payback else "—"
+                st.metric("Payback pieces", label_payback)
+            with b2:
+                payback_revenue = (
+                    _fmt_money(simbolo_base, float(selling_price) * float(pieces_to_payback))
+                    if has_payback else "—"
+                )
+                st.metric("Revenue at payback", payback_revenue)
+            with b3:
+                st.metric("Fixed monthly total", _fmt_money(simbolo_base, fixed_monthly_total))
+            with b4:
+                label_break = f"{float(breakeven_volume):.0f} pcs/mo" if has_breakeven else "—"
+                st.metric("Breakeven volume", label_break)
+
+            st.caption(f"Net investment: {_fmt_money(simbolo_base, effective_investment)}")
 
     with col_right:
         st.markdown("#### Notes")
         st.info(
             "ROI uses the unit cost calculated in this tab. "
-            "Adjust selling price, monthly volume and upfront investment to test scenarios. "
+            "Adjust selling price, monthly volume and initial investment to test scenarios. "
             "Extra monthly costs are subtracted before ROI is calculated. "
             "Resale value can reduce the investment or be treated as a terminal cash inflow."
         )
@@ -1703,7 +2097,7 @@ def render_roi_tab():
             if terminal_inflow > 0:
                 denom_end = (1.0 + r_month) ** months if r_month > 0 else 1.0
                 npv += float(terminal_inflow) / denom_end
-            st.metric("NPV", f"{simbolo_base} {npv:,.2f}".replace(",", ""))
+            st.metric("NPV", _fmt_money(simbolo_base, npv))
         else:
             st.info("Set a valid horizon to compute NPV.")
 #
@@ -1719,14 +2113,33 @@ def _safe_float(v, default: float = 0.0) -> float:
     except Exception:
         return float(default)
 
+def _fmt_number(value: float, decimals: int = 2) -> str:
+    v = _safe_float(value)
+    fmt = f"{v:,.{decimals}f}"
+    return fmt.replace(",", "X").replace(".", ",").replace("X", ".")
+
 
 def _fmt_money(symbol: str, value: float) -> str:
     v = _safe_float(value)
     if abs(v) < 0.0005:
-        return f"{symbol} 0.00"
+        return f"{symbol} {_fmt_number(0.0, 2)}"
     if abs(v) < 0.01:
-        return f"{symbol} {v:.4f}"
-    return f"{symbol} {v:.2f}"
+        return f"{symbol} {_fmt_number(v, 4)}"
+    return f"{symbol} {_fmt_number(v, 2)}"
+
+
+def _render_cost_label(text: str, value: str, bg_color: str) -> None:
+    st.markdown(
+        f"""
+        <div style="display:flex;justify-content:space-between;align-items:center;
+                    background:{bg_color};padding:6px 10px;border-radius:8px;
+                    margin-bottom:6px;">
+            <span>{text}</span>
+            <span><strong>{value}</strong></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 
@@ -1779,6 +2192,25 @@ def render_cost_tab():
     if "consumo_file" not in st.session_state:
         st.session_state["consumo_file"] = None
 
+    if "sheet_time_per_piece_min" not in st.session_state:
+        st.session_state["sheet_time_per_piece_min"] = 0.0
+    if "sheet_selected_jobs" not in st.session_state:
+        st.session_state["sheet_selected_jobs"] = []
+    if "cost_print_passes" not in st.session_state:
+        st.session_state["cost_print_passes"] = 1
+    if "cost_custom_print_time_min" not in st.session_state:
+        st.session_state["cost_custom_print_time_min"] = 0.0
+    if "cost_custom_print_time_hms" not in st.session_state:
+        st.session_state["cost_custom_print_time_hms"] = ""
+    if "cost_print_time_source" not in st.session_state:
+        st.session_state["cost_print_time_source"] = ""
+    if "cost_use_sheet_time_override" not in st.session_state:
+        st.session_state["cost_use_sheet_time_override"] = False
+    if "cost_auto_apply_sheet" not in st.session_state:
+        st.session_state["cost_auto_apply_sheet"] = True
+    if "cost_lock_print_time" not in st.session_state:
+        st.session_state["cost_lock_print_time"] = False
+
     st.markdown("### General Inputs")
     c_econ, c_insumo, c_team = st.columns(3, gap="large")
 
@@ -1816,7 +2248,8 @@ def render_cost_tab():
             step=0.1,
             help="Average dryer/curing unit power consumption during production."
         )
-        st.caption(f"Estimated energy: {simbolo_base} {((consumo_maquina_kw+consumo_forno_kw)*kwh):.2f}/h")
+        est_energy = (consumo_maquina_kw + consumo_forno_kw) * kwh
+        st.caption(f"Estimated energy: {_fmt_money(simbolo_base, est_energy)}/h")
 
     with c_insumo:
         st.subheader("2. Ink Costs")
@@ -1828,6 +2261,7 @@ def render_cost_tab():
         preco_tinta_ml_manual = None
         preco_tinta_litro = 0.0
         moeda_tinta = "USD"
+        fix_price_ml_manual = None
         if modo_preco == "Per liter":
             moeda_tinta = st.selectbox(
                 "Liter currency",
@@ -1841,6 +2275,20 @@ def render_cost_tab():
                 step=1.0,
                 help="Ink price per liter in the selected liter currency."
             )
+            fixation_liter_price = st.number_input(
+                "Fixation price per liter",
+                value=float(preco_tinta_litro or 0.0),
+                step=1.0,
+                help="Fixation price per liter in the selected currency. If left at 0, the app uses the same price as ink."
+            )
+            if fixation_liter_price and float(fixation_liter_price) > 0:
+                if moeda_tinta == moeda_base:
+                    fix_price_ml_manual = float(fixation_liter_price) / 1000.0
+                elif dolar > 0:
+                    if moeda_tinta == "USD" and moeda_base == "BRL":
+                        fix_price_ml_manual = (float(fixation_liter_price) * float(dolar)) / 1000.0
+                    elif moeda_tinta == "BRL" and moeda_base == "USD":
+                        fix_price_ml_manual = (float(fixation_liter_price) / float(dolar)) / 1000.0
         else:
             preco_tinta_ml_manual = st.number_input(
                 f"Ink price per ml ({simbolo_base})",
@@ -1849,24 +2297,38 @@ def render_cost_tab():
                 format="%.3f",
                 help="Direct ink price per ml in the base currency."
             )
+            fixation_liter_price = st.number_input(
+                f"Fixation price per liter ({simbolo_base})",
+                value=0.0,
+                step=1.0,
+                help="Fixation price per liter in the base currency. If left at 0, the app uses the same price as ink."
+            )
+            if fixation_liter_price and float(fixation_liter_price) > 0:
+                fix_price_ml_manual = float(fixation_liter_price) / 1000.0
+
+        if fix_price_ml_manual is not None:
+            st.caption(f"Fixation price (per ml): {_fmt_money(simbolo_base, fix_price_ml_manual)}")
 
     with c_team:
         st.subheader("3. Labor")
         sal_op = st.number_input(
             f"Operator ({simbolo_base})",
             value=3000.0,
-            help="Monthly base salary for the main operator."
+            help="Monthly base salary for the main operator.",
+            key="cost_sal_op"
         )
         sal_aj = st.number_input(
             f"Assistant ({simbolo_base})",
             value=2500.0,
-            help="Monthly base salary for the assistant/second operator."
+            help="Monthly base salary for the assistant/second operator.",
+            key="cost_sal_aj"
         )
         sal_designer = st.number_input(
             f"Designer ({simbolo_base})",
             value=0.0,
             step=100.0,
-            help="Monthly base salary for the designer/prepress resource (optional)."
+            help="Monthly base salary for the designer/prepress resource (optional).",
+            key="cost_sal_designer"
         )
 
         design_time_hours = st.number_input(
@@ -1882,14 +2344,16 @@ def render_cost_tab():
             "Labor burden / overhead (%)",
             value=0.80,
             step=0.05,
-            help="Extra labor burden over base salaries (benefits, taxes, HR overhead). Example: 0.80 = +80% over base salaries."
+            help="Extra labor burden over base salaries (benefits, taxes, HR overhead). Example: 0.80 = +80% over base salaries.",
+            key="cost_encargos"
         )
         st.caption("Tip: 0.80 = +80% overhead over base salaries.")
         horas_mes = st.number_input(
             "Hours/month",
             value=220,
             step=10,
-            help="Expected productive hours per month. Used to convert monthly labor and service costs into hourly rates."
+            help="Expected productive hours per month. Used to convert monthly labor and service costs into hourly rates.",
+            key="cost_horas_mes"
         )
         if st.button("🔄 Reset", type="secondary"):
             st.session_state.clear()
@@ -1929,7 +2393,7 @@ def render_cost_tab():
         else:
             machine_value = float(machine_value_raw)
 
-        st.caption(f"Machine value in base currency: {simbolo_base} {machine_value:,.0f}".replace(",", ""))
+        st.caption(f"Machine value in base currency: {simbolo_base} {_fmt_number(machine_value, 0)}")
 
         dep_months = st.number_input(
             "Depreciation (months)",
@@ -1968,8 +2432,8 @@ def render_cost_tab():
         else:
             residual_value = float(resale_value_raw)
 
-        st.caption(f"Resale value in base currency: {simbolo_base} {residual_value:,.0f}".replace(",", ""))
-        st.caption(f"Depreciable base: {simbolo_base} {max(machine_value - residual_value, 0.0):,.0f}".replace(",", ""))
+        st.caption(f"Resale value in base currency: {simbolo_base} {_fmt_number(residual_value, 0)}")
+        st.caption(f"Depreciable base: {simbolo_base} {_fmt_number(max(machine_value - residual_value, 0.0), 0)}")
     with col_blank:
         st.subheader("5. Blank T-shirt")
         tshirt_cost = st.number_input(
@@ -2140,8 +2604,8 @@ def render_cost_tab():
         extras_per_piece_total = float(per_piece_vals.fillna(0).sum()) if isinstance(per_piece_vals, pd.Series) else 0.0
 
     st.caption(
-        f"Custom adders totals → Monthly: {simbolo_base} {extras_monthly_total:.2f} | "
-        f"Per piece: {simbolo_base} {extras_per_piece_total:.2f}"
+        f"Custom adders totals → Monthly: {_fmt_money(simbolo_base, extras_monthly_total)} | "
+        f"Per piece: {_fmt_money(simbolo_base, extras_per_piece_total)}"
     )
 
     # ---------------------------------------------------------
@@ -2243,7 +2707,7 @@ def render_cost_tab():
 
     if press_enabled:
         st.caption(
-            f"Heat press value in base currency: {simbolo_base} {press_value:,.0f}".replace(",", "")
+            f"Heat press value in base currency: {simbolo_base} {_fmt_number(press_value, 0)}"
         )
     if press_enabled and not press_use_same_labor:
         st.caption("Dedicated press labor rate will be used for the heat press step.")
@@ -2251,7 +2715,7 @@ def render_cost_tab():
             (float(press_operator_salary) * (1 + float(encargos)) / float(horas_mes))
             if float(horas_mes) > 0 else 0.0
         )
-        st.caption(f"Estimated dedicated press labor rate: {simbolo_base} {est_press_custo_hora:.2f}/h")
+        st.caption(f"Estimated dedicated press labor rate: {_fmt_money(simbolo_base, est_press_custo_hora)}/h")
 
     # ---------------------------------------------------------
     # Order Data (horizontal, full-width)
@@ -2272,7 +2736,8 @@ def render_cost_tab():
             "Quantity",
             value=1000,
             step=50,
-            help="Current order quantity for this quote (used to calculate unit cost and total job cost)."
+            help="Current order quantity for this quote (used to calculate unit cost and total job cost).",
+            key="cost_qty"
         )
     with od2:
         complexidade = st.selectbox(
@@ -2296,10 +2761,12 @@ def render_cost_tab():
         "• Manual: you type CMYK/White/Qfix ml per piece.\n"
         "• File (PNG/TIFF): the app extracts Total C/W/Q from a CPP export (with OCR fallback)."
     )
-    tab_p, tab_m, tab_a = st.tabs(["Default", "Manual", "File (PNG/TIFF)"])
+    tab_p, tab_m, tab_a, tab_s = st.tabs(["Default", "Manual", "File (PNG/TIFF)", "Spreadsheet (XLSX)"])
 
     with tab_p:
         st.info("Uses the default consumption for the selected complexity.")
+        if int(st.session_state.get("cost_print_passes", 1)) > 1:
+            st.warning("You selected multiple print passes. Default mode uses a single consumption source.")
         if st.button("Calculate (Default)", type="primary", key="calc_p"):
             st.session_state["calc_mode"] = "padrao"
             st.session_state["consumo_override"] = None
@@ -2307,6 +2774,8 @@ def render_cost_tab():
 
     with tab_m:
         st.caption("Enter consumption per color (ml/piece).")
+        if int(st.session_state.get("cost_print_passes", 1)) > 1:
+            st.warning("You selected multiple print passes. Manual mode uses a single consumption source.")
         c1, c2 = st.columns(2, gap="large")
         with c1:
             cm = st.number_input("CMYK ml", min_value=0.0, value=4.0, step=0.1, key="cm_manual_tab")
@@ -2336,6 +2805,7 @@ def render_cost_tab():
             erros = []
             canais_sum = {}
             file_rows = []
+            required_passes = int(st.session_state.get("cost_print_passes", 1))
 
             for arq in arquivos:
                 consumo_file, erro_file = extrair_consumo_de_imagem(arq)
@@ -2429,9 +2899,252 @@ def render_cost_tab():
             if st.session_state.get("consumo_file") is None:
                 st.error("Upload at least one valid file before calculating.")
             else:
-                st.session_state["calc_mode"] = "arquivo"
-                st.session_state["consumo_override"] = st.session_state.get("consumo_file")
+                required_passes = int(st.session_state.get("cost_print_passes", 1))
+                if required_passes > 1 and len(arquivos or []) < required_passes:
+                    st.error(
+                        f"Print passes = {required_passes}. Upload at least {required_passes} files "
+                        "so each pass has its own consumption file."
+                    )
+                else:
+                    st.session_state["calc_mode"] = "arquivo"
+                    st.session_state["consumo_override"] = st.session_state.get("consumo_file")
+    with tab_s:
+        st.caption("Upload the XLSX exported from Job Consumption / Ink Consumption report.")
 
+        auto_apply_sheet = st.checkbox(
+            "Auto-apply spreadsheet data to this quote",
+            value=bool(st.session_state.get("cost_auto_apply_sheet", True)),
+            help="When enabled, selected jobs automatically update ink consumption for the quote.",
+            key="cost_auto_apply_sheet"
+        )
+
+        sheet_file = st.file_uploader(
+            "Spreadsheet (.xlsx)",
+            type=["xlsx", "xls"],
+            key="cost_up_sheet",
+            help="Upload the Job Consumption export. Then select the Job Name(s) from column A."
+        )
+
+        if sheet_file:
+            df_sheet, cols, err_sheet = extrair_consumo_de_planilha(sheet_file)
+            if err_sheet:
+                st.error(err_sheet)
+            elif df_sheet is None or df_sheet.empty:
+                st.error("Spreadsheet loaded but has no data rows.")
+            else:
+                if cols is None:
+                    st.error("Spreadsheet columns could not be parsed.")
+                    st.stop()
+                if cols.get("job_fallback"):
+                    st.info("Job Name column not found. Using column A as the job selector.")
+
+                job_col = cols["job"]
+                job_label = "Job Name / column A" if not cols.get("job_fallback") else "column A"
+
+                def _label_for_row(idx: int) -> str:
+                    row = df_sheet.loc[idx]
+                    job_name_raw = str(row.get(job_col, "")).strip()
+                    job_name = job_name_raw
+                    if len(job_name) > 40:
+                        job_name = job_name[:37] + "..."
+                    time_val = row.get(cols.get("time")) if cols.get("time") else ""
+                    date_val = row.get(cols.get("date")) if cols.get("date") else ""
+                    return f"{job_name} | Time {time_val} | Date {date_val}"
+
+                row_options = df_sheet.index.tolist()
+                default_rows = st.session_state.get("sheet_selected_jobs") or []
+                if not default_rows and row_options:
+                    default_rows = [row_options[0]]
+
+                selected_rows = st.multiselect(
+                    f"Select row(s) ({job_label})",
+                    options=row_options,
+                    default=default_rows,
+                    format_func=_label_for_row,
+                    key="cost_sheet_jobs"
+                )
+
+                required_passes = int(st.session_state.get("cost_print_passes", 1))
+                if required_passes > 1 and len(selected_rows) < required_passes:
+                    st.error(
+                        f"Print passes = {required_passes}. Select at least {required_passes} rows "
+                        "so each pass has its own record."
+                    )
+
+                if selected_rows and (required_passes <= 1 or len(selected_rows) >= required_passes):
+                    consumo_sheet, err_agg = agregar_consumo_por_linhas(df_sheet, cols, selected_rows)
+                    if err_agg:
+                        st.error(err_agg)
+                    else:
+                        if consumo_sheet is None:
+                            st.error("Could not aggregate spreadsheet data.")
+                            st.stop()
+                        c_ml = float(consumo_sheet.get("cmyk_ml", 0.0))
+                        w_ml = float(consumo_sheet.get("white_ml", 0.0))
+                        q_ml = float(consumo_sheet.get("qfix_ml", 0.0))
+                        tpp = float(consumo_sheet.get("sheet_time_per_piece_min", 0.0))
+                        img_h = float(consumo_sheet.get("sheet_img_h_mm", 0.0))
+                        img_w = float(consumo_sheet.get("sheet_img_w_mm", 0.0))
+                        debug_matches = consumo_sheet.get("debug_matches", [])
+
+                        total_ml = c_ml + w_ml + q_ml
+                        m1, m2, m3, m4, m5, m6 = st.columns(6, gap="large")
+                        m1.metric("Total Color (ml/piece)", f"{c_ml:.2f}")
+                        m2.metric("Total White (ml/piece)", f"{w_ml:.2f}")
+                        m3.metric("Total Enhancers (ml/piece)", f"{q_ml:.2f}")
+                        m4.metric("Total Ink (ml/piece)", f"{total_ml:.2f}")
+                        if tpp > 0:
+                            tpp_sec = int(round(float(tpp) * 60.0))
+                            hours = tpp_sec // 3600
+                            minutes = (tpp_sec % 3600) // 60
+                            seconds = tpp_sec % 60
+                            if hours > 0:
+                                tpp_fmt = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+                            else:
+                                tpp_fmt = f"{minutes:02d}:{seconds:02d}"
+                            m5.metric("Print time (mm:ss/piece)", f"{tpp_fmt}")
+                            st.caption(f"Print time (min/piece): {tpp:.2f}")
+                        else:
+                            m5.metric("Print time (mm:ss/piece)", "—")
+                        if img_w > 0 or img_h > 0:
+                            m6.metric("Image size (mm)", f"{img_w:.0f} × {img_h:.0f}")
+                        else:
+                            m6.metric("Image size (mm)", "—")
+
+                        with st.expander("Raw values (full precision)", expanded=False):
+                            st.write(f"Total Color (ml/piece): {c_ml:.2f}")
+                            st.write(f"Total White (ml/piece): {w_ml:.2f}")
+                            st.write(f"Total Enhancers (ml/piece): {q_ml:.2f}")
+                            st.write(f"Total Ink (ml/piece): {total_ml:.2f}")
+                            if tpp > 0:
+                                st.write(f"Print time (min/piece): {tpp:.2f}")
+                            if img_w > 0 or img_h > 0:
+                                st.write(f"Image size (mm): {img_w:.2f} × {img_h:.2f}")
+
+                        passes_now = int(st.session_state.get("cost_print_passes", 1))
+                        setup_min = float(st.session_state.get("cost_setup_min", 15.0))
+                        curing_label = str(st.session_state.get("cost_curing_model", "Legacy (included in job time)"))
+                        curing_key = (
+                            "batch_per_pass" if curing_label.startswith("Batch")
+                            else "fixed_per_pass" if curing_label.startswith("Fixed")
+                            else "legacy"
+                        )
+                        cure_time_val = float(st.session_state.get("cost_cure_time_min", 23.0))
+                        cure_handling_val = float(st.session_state.get("cost_cure_handling_min", 0.0))
+                        batch_size_val = int(st.session_state.get("cost_dryer_batch_size", 10))
+
+                        tempo_cura_min = 0.0
+                        if curing_key == "fixed_per_pass":
+                            tempo_cura_min = float(passes_now) * float(cure_time_val)
+                        elif curing_key == "batch_per_pass":
+                            import math
+                            cycles_per_pass = int(math.ceil(float(qtd) / float(batch_size_val))) if qtd and batch_size_val else 0
+                            tempo_cura_min = float(passes_now) * float(cycles_per_pass) * float(cure_time_val + cure_handling_val)
+
+                        if tpp > 0:
+                            est_print_total = float(tpp) * float(qtd) * float(passes_now)
+                            est_total = float(est_print_total) + float(setup_min) + float(tempo_cura_min)
+
+                            total_sal = _safe_float(sal_op) + _safe_float(sal_aj)
+                            custo_minuto_equipe = (
+                                (total_sal * (1 + _safe_float(encargos))) / float(horas_mes) / 60.0
+                                if float(horas_mes) > 0 else 0.0
+                            )
+                            labor_total = est_total * float(custo_minuto_equipe)
+                            labor_unit = (labor_total / float(qtd)) if float(qtd) > 0 else 0.0
+
+                            st.caption(
+                                f"Estimated total job time: {_fmt_number(est_total, 1)} min "
+                                f"(print { _fmt_number(est_print_total, 1)} + setup { _fmt_number(setup_min, 1)} + curing { _fmt_number(tempo_cura_min, 1)})."
+                            )
+                            st.caption(
+                                f"Labor (print + setup + curing): {_fmt_money(simbolo_base, labor_total)} total "
+                                f"| {_fmt_money(simbolo_base, labor_unit)} per piece."
+                            )
+                            st.caption(
+                                f"Print time calculation: {tpp_fmt} per piece × {int(qtd)} pcs × {int(passes_now)} pass(es) "
+                                f"= {_fmt_number(est_print_total, 1)} min."
+                            )
+                            if bool(st.session_state.get("cost_use_sheet_time_override", False)):
+                                eff_show = float(st.session_state.get("cost_efficiency", 1.0))
+                                if eff_show <= 0:
+                                    eff_show = 1.0
+                                st.caption(
+                                    f"Efficiency adjustment: {_fmt_number(est_print_total, 1)} min ÷ {eff_show:.2f} "
+                                    f"= {_fmt_number(est_print_total / eff_show, 1)} min."
+                                )
+                            if curing_key == "fixed_per_pass":
+                                st.caption(
+                                    f"Curing time (fixed): {int(passes_now)} pass(es) × {float(cure_time_val):.1f} min "
+                                    f"= {_fmt_number(tempo_cura_min, 1)} min."
+                                )
+                            elif curing_key == "batch_per_pass":
+                                st.caption(
+                                    f"Curing time (batch): {int(passes_now)} pass(es) × "
+                                    f"{int(math.ceil(float(qtd) / float(batch_size_val))) if qtd and batch_size_val else 0} batch(es) × "
+                                    f"{float(cure_time_val + cure_handling_val):.1f} min = {_fmt_number(tempo_cura_min, 1)} min."
+                                )
+
+                        def _apply_sheet_to_quote():
+                            st.session_state["calc_mode"] = "planilha"
+                            st.session_state["consumo_override"] = {
+                                "cmyk_ml": c_ml,
+                                "white_ml": w_ml,
+                                "qfix_ml": q_ml,
+                                "total_ml": c_ml + w_ml + q_ml,
+                                "debug_matches": debug_matches,
+                                "canais_consumo": [],
+                            }
+                            st.session_state["sheet_time_per_piece_min"] = tpp
+                            st.session_state["sheet_img_h_mm"] = img_h
+                            st.session_state["sheet_img_w_mm"] = img_w
+                            st.session_state["sheet_selected_jobs"] = list(selected_rows)
+
+                            if not bool(st.session_state.get("cost_lock_print_time", False)):
+                                if bool(st.session_state.get("cost_use_sheet_time_override", False)) and tpp > 0:
+                                    eff = float(st.session_state.get("cost_efficiency", 1.0))
+                                    if eff <= 0:
+                                        eff = 1.0
+                                    base_minutes = float(tpp) * float(qtd) * float(passes_now)
+                                    total_minutes = base_minutes / eff
+                                    st.session_state["cost_custom_print_time_min"] = total_minutes
+                                    st.session_state["cost_custom_print_time_hms"] = _format_seconds_hms(
+                                        total_minutes * 60.0
+                                    )
+                                    st.session_state["cost_print_time_source"] = "sheet"
+                                else:
+                                    st.session_state["cost_custom_print_time_min"] = 0.0
+                                    st.session_state["cost_custom_print_time_hms"] = ""
+                                    st.session_state["cost_print_time_source"] = ""
+
+                            # do not show CPP file charts when using sheet
+                            st.session_state["cpp_breakdown"] = None
+
+                        if auto_apply_sheet:
+                            _apply_sheet_to_quote()
+                            st.caption("Spreadsheet data applied automatically to this quote.")
+                        else:
+                            if st.button("Apply spreadsheet data to this quote", type="primary", key="cost_apply_sheet"):
+                                _apply_sheet_to_quote()
+
+                        with st.expander("Preview selected rows", expanded=False):
+                            preview_cols = [
+                                c for c in [
+                                    cols.get("job"),
+                                    cols.get("len"),
+                                    cols.get("color"),
+                                    cols.get("white"),
+                                    cols.get("enh"),
+                                    cols.get("img_h"),
+                                    cols.get("img_w"),
+                                    cols.get("time"),
+                                    cols.get("date"),
+                                ] if c
+                            ]
+                            st.dataframe(
+                                df_sheet.loc[selected_rows][preview_cols].head(50),
+                                use_container_width=True
+                            )
     st.markdown("#### Production parameters")
     sp1, sp2, sp3 = st.columns(3, gap="large")
 
@@ -2446,12 +3159,15 @@ def render_cost_tab():
             "Efficiency",
             0.4, 1.0, 0.70,
             help="Real-world efficiency applied to the nominal speed (accounts for pauses, handling, and operational losses)."
+            ,
+            key="cost_efficiency"
         )
     with sp3:
         setup = st.number_input(
             "Setup (min)",
             value=15,
-            help="Preparation time added once per job (loading, alignment, tests). Included in total job time."
+            help="Preparation time added once per job (loading, alignment, tests). Included in total job time.",
+            key="cost_setup_min"
         )
 
     mp1, mp2 = st.columns(2, gap="large")
@@ -2459,36 +3175,101 @@ def render_cost_tab():
         print_passes = st.number_input(
             "Print passes (front/back/label)",
             min_value=1,
-            value=1,
+            value=int(st.session_state.get("cost_print_passes", 1)),
             step=1,
-            help="Use 1 for a single print, 2 for front+back, 3 for front+back+label, etc. Increases print time."
+            help="Use 1 for a single print, 2 for front+back, 3 for front+back+label, etc. Increases print time.",
+            key="cost_print_passes"
         )
     with mp2:
-        custom_print_time_min = st.number_input(
-            "Override total print time (min)",
-            min_value=0.0,
-            value=0.0,
-            step=1.0,
-            help="Optional: replace calculated print time with a measured total (before setup). If lower than speed implies, the app keeps the minimum based on speed."
+        lock_print_time = st.checkbox(
+            "Lock print time override",
+            value=bool(st.session_state.get("cost_lock_print_time", False)),
+            help="When enabled, spreadsheet imports will not overwrite the manual print time override.",
+            key="cost_lock_print_time"
         )
+        use_sheet_time_override = st.checkbox(
+            "Use spreadsheet print time as base (apply efficiency)",
+            value=bool(st.session_state.get("cost_use_sheet_time_override", False)),
+            help="When enabled, the spreadsheet print time is adjusted by efficiency and used as total print time.",
+            key="cost_use_sheet_time_override"
+        )
+        if _safe_float(st.session_state.get("cost_custom_print_time_min", 0.0)) > 0:
+            st.info("Print time override is active. Speed does not affect total print time.")
+            if st.session_state.get("cost_print_time_source") == "sheet":
+                if st.button("Clear print time override", key="cost_clear_print_time_override"):
+                    st.session_state["cost_custom_print_time_min"] = 0.0
+                    st.session_state["cost_custom_print_time_hms"] = ""
+                    st.session_state["cost_print_time_source"] = ""
+        default_hms = str(st.session_state.get("cost_custom_print_time_hms", "")).strip()
+        if not default_hms:
+            prev_min = _safe_float(st.session_state.get("cost_custom_print_time_min", 0.0))
+            if prev_min > 0:
+                default_hms = _format_seconds_hms(prev_min * 60.0)
+
+        hms_input = st.text_input(
+            "Override total print time (hh:mm:ss)",
+            value=default_hms,
+            help="Optional: replace calculated print time with a measured total (before setup).",
+            key="cost_custom_print_time_hms"
+        )
+
+        hms_clean = str(hms_input or "").strip()
+        if hms_clean:
+            seconds = _parse_hms_to_seconds(hms_clean)
+            if seconds <= 0 and hms_clean not in ("0", "0:00", "00:00", "00:00:00"):
+                st.error("Invalid time format. Use hh:mm:ss (e.g., 01:23:45) or mm:ss (e.g., 01:27).")
+            else:
+                st.session_state["cost_custom_print_time_min"] = float(seconds) / 60.0
+                st.session_state["cost_print_time_source"] = "manual"
+        else:
+            st.session_state["cost_custom_print_time_min"] = 0.0
+            if st.session_state.get("cost_print_time_source") == "manual":
+                st.session_state["cost_print_time_source"] = ""
+        custom_print_time_min = _safe_float(st.session_state.get("cost_custom_print_time_min", 0.0))
 
     st.markdown("#### Curing model (per pass)")
 
     curing_model = st.selectbox(
         "Curing time model",
-        options=["Legacy (included in job time)", "Batch curing per pass (front/back/label)"],
+        options=[
+            "Legacy (included in job time)",
+            "Fixed time per pass (front/back/label)",
+            "Batch curing per pass (front/back/label)"
+        ],
         index=0,
         help=(
             "Legacy: keeps current behavior (dryer energy/time considered across the whole job time).\n"
-            "Batch curing per pass: adds curing time as batches for EACH print pass (front/back/label)."
+            "Fixed time per pass: adds a fixed curing time for EACH print pass.\n"
+            "Batch curing per pass: adds curing time as batches for EACH print pass."
         ),
+        key="cost_curing_model"
     )
 
-    curing_model_key = "batch_per_pass" if curing_model.startswith("Batch") else "legacy"
+    if curing_model.startswith("Batch"):
+        curing_model_key = "batch_per_pass"
+    elif curing_model.startswith("Fixed"):
+        curing_model_key = "fixed_per_pass"
+    else:
+        curing_model_key = "legacy"
 
     dryer_batch_size = 10
     cure_time_min = 23.0
     cure_handling_min = 0.0
+
+    if curing_model_key == "fixed_per_pass":
+        cure_time_min = st.number_input(
+            "Cure time per pass (min)",
+            min_value=0.0,
+            value=23.0,
+            step=1.0,
+            help="Fixed curing time applied once per pass.",
+            key="cost_cure_time_min"
+        )
+        total_cure_preview = float(print_passes) * float(cure_time_min)
+        st.caption(
+            f"Preview: {int(print_passes)} pass(es) × {float(cure_time_min):.1f} min → "
+            f"{total_cure_preview:.1f} min curing time added."
+        )
 
     if curing_model_key == "batch_per_pass":
         ccu1, ccu2, ccu3 = st.columns(3, gap="large")
@@ -2499,6 +3280,7 @@ def render_cost_tab():
                 value=10,
                 step=1,
                 help="How many T-shirts fit in ONE curing cycle (batch).",
+                key="cost_dryer_batch_size"
             )
         with ccu2:
             cure_time_min = st.number_input(
@@ -2507,6 +3289,7 @@ def render_cost_tab():
                 value=23.0,
                 step=1.0,
                 help="Fixed curing time per batch (e.g., 23 minutes).",
+                key="cost_cure_time_min"
             )
         with ccu3:
             cure_handling_min = st.number_input(
@@ -2515,6 +3298,7 @@ def render_cost_tab():
                 value=0.0,
                 step=0.5,
                 help="Optional handling time per batch (loading/unloading/rack handling).",
+                key="cost_cure_handling_min"
             )
 
         import math
@@ -2551,6 +3335,7 @@ def render_cost_tab():
             preco_tinta_litro,
             moeda_tinta,
             preco_tinta_ml_manual,
+            fix_price_ml_manual,
             consumo_override,
             fixation_percent,
             kwh,
@@ -2620,11 +3405,49 @@ def render_cost_tab():
                 except Exception:
                     pass
             k1, k2, k3 = st.columns(3)
-            k1.metric("Unit Cost", f"{simbolo_base} {res['custo_final_unit']:.2f}")
+            k1.metric("Unit Cost", _fmt_money(simbolo_base, res["custo_final_unit"]))
             total_h = float(res.get("tempo_horas", 0.0))
             total_min = float(res.get("tempo_total_min", 0.0))
             k2.metric("Total Time", f"{total_h:.1f} h", f"{total_min:.0f} min")
             k3.metric("Real Speed", f"{int(res['vel_real'])} pcs/h")
+
+            if st.session_state.get("calc_mode") == "planilha":
+                tpp = _safe_float(st.session_state.get("sheet_time_per_piece_min", 0.0))
+                passes_now = int(st.session_state.get("cost_print_passes", 1))
+                if tpp > 0 and float(qtd) > 0:
+                    base_min = float(tpp) * float(qtd) * float(passes_now)
+                    if bool(st.session_state.get("cost_use_sheet_time_override", False)):
+                        eff_show = float(st.session_state.get("cost_efficiency", 1.0))
+                        if eff_show <= 0:
+                            eff_show = 1.0
+                        adj_min = base_min / eff_show
+                        st.caption(
+                            f"Total time formula (sheet): {tpp:.2f} min/pc × {int(qtd)} pcs × {int(passes_now)} pass(es) "
+                            f"÷ {eff_show:.2f} efficiency = {_fmt_number(adj_min, 1)} min"
+                        )
+                    else:
+                        st.caption(
+                            f"Total time formula (sheet): {tpp:.2f} min/pc × {int(qtd)} pcs × {int(passes_now)} pass(es) "
+                            f"= {_fmt_number(base_min, 1)} min"
+                        )
+            else:
+                print_min = float(res.get("tempo_impressao_min", 0.0))
+                setup_min = float(res.get("tempo_setup_min", 0.0))
+                curing_min = float(res.get("tempo_cura_min", 0.0))
+                st.caption(
+                    f"Total time formula: print {_fmt_number(print_min, 1)} min + "
+                    f"setup {_fmt_number(setup_min, 1)} min + "
+                    f"curing {_fmt_number(curing_min, 1)} min = {_fmt_number(total_min, 1)} min"
+                )
+                if _safe_float(st.session_state.get("cost_custom_print_time_min", 0.0)) <= 0:
+                    vel_real = float(res.get("vel_real", 0.0))
+                    passes_now = int(st.session_state.get("cost_print_passes", 1))
+                    if vel_real > 0 and float(qtd) > 0:
+                        base_print_min = (float(qtd) / vel_real) * float(passes_now) * 60.0
+                        st.caption(
+                            f"Print time (speed/efficiency): {int(qtd)} pcs ÷ {vel_real:.1f} pcs/h × "
+                            f"{int(passes_now)} pass(es) = {_fmt_number(base_print_min, 1)} min"
+                        )
 
             if curing_model_key == "batch_per_pass":
                 st.caption(
@@ -2658,15 +3481,15 @@ def render_cost_tab():
             press_pp = float(res.get("custo_press_unit", 0.0))
 
             jc1, jc2, jc3, jc4 = st.columns(4, gap="large")
-            jc1.metric("Total job cost", f"{simbolo_base} {total_job_cost:,.2f}".replace(",", ""))
-            jc2.metric(f"Cost per reference batch ({batch_size} pcs)", f"{simbolo_base} {cost_per_batch:,.2f}".replace(",", ""))
-            jc3.metric("Service/Platform per piece", f"{simbolo_base} {service_platform_pp:.2f}")
-            jc4.metric("Heat press per piece", f"{simbolo_base} {press_pp:.2f}")
+            jc1.metric("Total job cost", _fmt_money(simbolo_base, total_job_cost))
+            jc2.metric(f"Cost per reference batch ({batch_size} pcs)", _fmt_money(simbolo_base, cost_per_batch))
+            jc3.metric("Service/Platform per piece", _fmt_money(simbolo_base, service_platform_pp))
+            jc4.metric("Heat press per piece", _fmt_money(simbolo_base, press_pp))
 
             if press_enabled:
                 press_labor_rate_used = float(res.get("custo_hora_press", 0.0))
-                st.caption(f"Heat press enabled — {simbolo_base} {press_pp:.2f} per piece included in unit cost.")
-                st.caption(f"Heat press labor rate used: {simbolo_base} {press_labor_rate_used:.2f}/h")
+                st.caption(f"Heat press enabled — {_fmt_money(simbolo_base, press_pp)} per piece included in unit cost.")
+                st.caption(f"Heat press labor rate used: {_fmt_money(simbolo_base, press_labor_rate_used)}/h")
             else:
                 st.caption("Heat press not included in this quote.")
 
@@ -2756,6 +3579,54 @@ def render_cost_tab():
                     st.metric("Energy / job", f"{total_kwh_job:.2f} kWh")
 
                 st.markdown("")
+                st.markdown("#### Ink & Fixation (per piece)")
+
+                ink_ml_pp = float(res.get("ml_base", 0.0))
+                fix_ml_pp = float(res.get("ml_fixation", 0.0))
+                ink_price_ml = float(res.get("preco_tinta_ml_base", 0.0))
+                fix_price_ml = float(res.get("preco_fix_ml_base", 0.0))
+                ink_cost_pp = ink_ml_pp * ink_price_ml
+                fix_cost_pp = fix_ml_pp * fix_price_ml
+                total_cost_pp = ink_cost_pp + fix_cost_pp
+
+                df_ink = pd.DataFrame(
+                    [
+                        {"Item": "Ink", "ml/piece": ink_ml_pp, "Price / ml": ink_price_ml, "Cost / piece": ink_cost_pp},
+                        {"Item": "Fixation", "ml/piece": fix_ml_pp, "Price / ml": fix_price_ml, "Cost / piece": fix_cost_pp},
+                        {"Item": "Total", "ml/piece": ink_ml_pp + fix_ml_pp, "Price / ml": 0.0, "Cost / piece": total_cost_pp},
+                    ]
+                )
+
+                c_ink1, c_ink2 = st.columns([1.2, 0.8], gap="large")
+                with c_ink1:
+                    df_show = df_ink.copy()
+                    df_show["ml/piece"] = df_show["ml/piece"].apply(lambda v: f"{float(v):.2f}")
+                    df_show["Price / ml"] = df_show["Price / ml"].apply(lambda v: _fmt_money(simbolo_base, float(v)) if float(v) > 0 else "—")
+                    df_show["Cost / piece"] = df_show["Cost / piece"].apply(lambda v: _fmt_money(simbolo_base, float(v)))
+                    st.dataframe(df_show, use_container_width=True, height=160)
+                with c_ink2:
+                    df_bar = df_ink.iloc[:2].copy()
+                    df_bar["Cost / piece"] = df_bar["Cost / piece"].astype(float)
+                    chart = (
+                        alt.Chart(df_bar)
+                        .mark_bar(size=42, cornerRadius=8)
+                        .encode(
+                            x=alt.X("Item:N", axis=alt.Axis(title=None, labelAngle=0)),
+                            y=alt.Y("Cost / piece:Q", title=f"Cost per piece ({simbolo_base})"),
+                            color=alt.Color("Item:N", legend=None),
+                            tooltip=[
+                                alt.Tooltip("Item:N"),
+                                alt.Tooltip("Cost / piece:Q", format=".4f"),
+                                alt.Tooltip("ml/piece:Q", format=".2f"),
+                            ],
+                        )
+                        .properties(height=180)
+                        .configure_view(stroke=None)
+                        .configure_axis(grid=True, gridOpacity=0.2)
+                    )
+                    st.altair_chart(chart, use_container_width=True)
+
+                st.markdown("")
 
                 st.markdown("#### Recommended price ladder")
 
@@ -2763,20 +3634,20 @@ def render_cost_tab():
                 standard_price = unit_cost * 1.30
                 aggressive_price = unit_cost * 1.50
                 if press_enabled and press_pp > 0:
-                    st.caption(f"Unit cost includes heat press: {simbolo_base} {press_pp:.2f} / piece")
+                    st.caption(f"Unit cost includes heat press: {_fmt_money(simbolo_base, press_pp)} / piece")
 
                 lp1, lp2, lp3 = st.columns(3, gap="large")
 
                 with lp1:
-                    st.metric("Conservative 20%", f"{simbolo_base} {conservative_price:.2f}")
+                    st.metric("Conservative 20%", _fmt_money(simbolo_base, conservative_price))
                 with lp2:
-                    st.metric("Standard 30%", f"{simbolo_base} {standard_price:.2f}")
+                    st.metric("Standard 30%", _fmt_money(simbolo_base, standard_price))
                 with lp3:
-                    st.metric("Aggressive 50%", f"{simbolo_base} {aggressive_price:.2f}")
+                    st.metric("Aggressive 50%", _fmt_money(simbolo_base, aggressive_price))
 
                 st.caption(
-                    f"Suggested selling range: {simbolo_base} {conservative_price:.2f} → "
-                    f"{simbolo_base} {standard_price:.2f} → {simbolo_base} {aggressive_price:.2f}"
+                    f"Suggested selling range: {_fmt_money(simbolo_base, conservative_price)} → "
+                    f"{_fmt_money(simbolo_base, standard_price)} → {_fmt_money(simbolo_base, aggressive_price)}"
                 )
 
                 st.markdown("")
@@ -2792,25 +3663,25 @@ def render_cost_tab():
                     a1, a2 = st.columns(2, gap="large")
                     with a1:
                         st.caption("Ink / ml")
-                        st.markdown(f"**{simbolo_base} {float(res.get('preco_tinta_ml_base', 0.0)):.3f}**")
+                        st.markdown(f"**{_fmt_money(simbolo_base, float(res.get('preco_tinta_ml_base', 0.0)))}**")
                     with a2:
                         st.caption("Energy / kWh")
-                        st.markdown(f"**{simbolo_base} {float(res.get('custo_energia_kwh', 0.0)):.3f}**")
+                        st.markdown(f"**{_fmt_money(simbolo_base, float(res.get('custo_energia_kwh', 0.0)))}**")
 
                     a3, a4 = st.columns(2, gap="large")
                     with a3:
                         st.caption("Dep / month")
-                        st.markdown(f"**{simbolo_base} {dep_month_value:.2f}**")
+                        st.markdown(f"**{_fmt_money(simbolo_base, dep_month_value)}**")
                     with a4:
                         st.caption("Labor / hour")
-                        st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_equipe', 0.0)):.2f}**")
+                        st.markdown(f"**{_fmt_money(simbolo_base, float(res.get('custo_hora_equipe', 0.0)))}**")
 
                     if design_time_hours and float(design_time_hours) > 0:
                         st.markdown("**Design assumptions**")
                         d1, d2 = st.columns(2, gap="large")
                         with d1:
                             st.caption("Designer labor / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_designer', 0.0)):.2f}**")
+                            st.markdown(f"**{_fmt_money(simbolo_base, float(res.get('custo_hora_designer', 0.0)))}**")
                         with d2:
                             st.caption("Design effort / order")
                             st.markdown(f"**{float(design_time_hours):.1f} h**")
@@ -2820,17 +3691,17 @@ def render_cost_tab():
                         hp1, hp2, hp3 = st.columns(3, gap="large")
                         with hp1:
                             st.caption("Press labor / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_hora_press', 0.0)):.2f}**")
+                            st.markdown(f"**{_fmt_money(simbolo_base, float(res.get('custo_hora_press', 0.0)))}**")
                         with hp2:
                             st.caption("Press dep / hour")
-                            st.markdown(f"**{simbolo_base} {float(res.get('custo_press_dep_hour', 0.0)):.2f}**")
+                            st.markdown(f"**{_fmt_money(simbolo_base, float(res.get('custo_press_dep_hour', 0.0)))}**")
                         with hp3:
                             st.caption("Press energy / hour")
                             press_energy_hour = float(press_kw) * float(kwh) if press_kw and kwh else 0.0
-                            st.markdown(f"**{simbolo_base} {press_energy_hour:.2f}**")
+                            st.markdown(f"**{_fmt_money(simbolo_base, press_energy_hour)}**")
 
                     st.caption("Blank / piece")
-                    st.markdown(f"**{simbolo_base} {float(tshirt_cost):.2f}**")
+                    st.markdown(f"**{_fmt_money(simbolo_base, float(tshirt_cost))}**")
 
             with top_right:
                 # ---------------------------------------------------------
@@ -2847,7 +3718,7 @@ def render_cost_tab():
 
                 sp_pp = float(res.get("custo_service_platform_unit", 0.0))
                 if sp_pp > 0:
-                    st.caption(f"Including Service/Platform: {simbolo_base} {sp_pp:.2f} per piece.")
+                    st.caption(f"Including Service/Platform: {_fmt_money(simbolo_base, sp_pp)} per piece.")
 
                 pm_left, pm_right = st.columns([1.35, 0.90], gap="large")
 
@@ -2858,9 +3729,9 @@ def render_cost_tab():
                         price = unit_cost * (1 + m / 100)
                         rows.append({
                             "Target margin": f"{m}%",
-                            "Sell price": f"{simbolo_base} {price:.2f}",
-                            "Profit/unit": f"{simbolo_base} {price - unit_cost:.2f}",
-                            "Service/Platform": f"{simbolo_base} {sp_pp:.2f}" if sp_pp > 0 else f"{simbolo_base} 0.00",
+                            "Sell price": _fmt_money(simbolo_base, price),
+                            "Profit/unit": _fmt_money(simbolo_base, price - unit_cost),
+                            "Service/Platform": _fmt_money(simbolo_base, sp_pp) if sp_pp > 0 else _fmt_money(simbolo_base, 0.0),
                         })
 
                     df_pricing = pd.DataFrame(rows)
@@ -2898,7 +3769,7 @@ def render_cost_tab():
                         st.markdown(f"**{profit_pct_from_price:.1f}%**")
                     with cB:
                         st.caption("Price from target")
-                        st.markdown(f"**{simbolo_base} {suggested_price_from_pct:.2f}**")
+                    st.markdown(f"**{_fmt_money(simbolo_base, suggested_price_from_pct)}**")
 
                     st.caption("Margin is calculated as markup over cost: (Sell − Cost) / Cost.")
 
