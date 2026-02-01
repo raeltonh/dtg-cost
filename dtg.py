@@ -1,5 +1,7 @@
 import re
+import math
 from pathlib import Path
+from typing import Any, Dict, Tuple
 import streamlit as st
 import altair as alt
 import pandas as pd
@@ -400,7 +402,7 @@ def _format_seconds_hms(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def extrair_consumo_de_planilha(uploaded_file):
+def extrair_consumo_de_planilha(uploaded_file) -> Tuple[pd.DataFrame | None, Dict[str, Any] | None, str | None]:
     """Read Kornit Job Consumption XLSX exports and return (df, cols, error)."""
 
     def _clean_col(c):
@@ -740,8 +742,6 @@ def calcular_custo_total(
 
     vel_real = velocidade_nominal * eficiencia * fator_vel
     if vel_real == 0: return "Error: zero speed."
-
-    import math
 
     passes = max(1, int(print_passes)) if print_passes is not None else 1
 
@@ -2926,32 +2926,36 @@ def render_cost_tab():
         )
 
         if sheet_file:
-            df_sheet, cols, err_sheet = extrair_consumo_de_planilha(sheet_file)
+            df_sheet, sheet_cols, err_sheet = extrair_consumo_de_planilha(sheet_file)
             if err_sheet:
                 st.error(err_sheet)
             elif df_sheet is None or df_sheet.empty:
                 st.error("Spreadsheet loaded but has no data rows.")
             else:
-                if cols is None:
+                if sheet_cols is None:
                     st.error("Spreadsheet columns could not be parsed.")
                     st.stop()
-                if cols.get("job_fallback"):
+                assert df_sheet is not None
+                assert sheet_cols is not None
+                df_sheet_local: pd.DataFrame = df_sheet
+                sheet_cols_local: Dict[str, Any] = sheet_cols
+                if sheet_cols.get("job_fallback"):
                     st.info("Job Name column not found. Using column A as the job selector.")
 
-                job_col = cols["job"]
-                job_label = "Job Name / column A" if not cols.get("job_fallback") else "column A"
+                job_col = sheet_cols_local["job"]
+                job_label = "Job Name / column A" if not sheet_cols_local.get("job_fallback") else "column A"
 
                 def _label_for_row(idx: int) -> str:
-                    row = df_sheet.loc[idx]
+                    row = df_sheet_local.loc[idx]
                     job_name_raw = str(row.get(job_col, "")).strip()
                     job_name = job_name_raw
                     if len(job_name) > 40:
                         job_name = job_name[:37] + "..."
-                    time_val = row.get(cols.get("time")) if cols.get("time") else ""
-                    date_val = row.get(cols.get("date")) if cols.get("date") else ""
+                    time_val = row.get(sheet_cols_local.get("time")) if sheet_cols_local.get("time") else ""
+                    date_val = row.get(sheet_cols_local.get("date")) if sheet_cols_local.get("date") else ""
                     return f"{job_name} | Time {time_val} | Date {date_val}"
 
-                row_options = df_sheet.index.tolist()
+                row_options = df_sheet_local.index.tolist()
                 default_rows = st.session_state.get("sheet_selected_jobs") or []
                 if not default_rows and row_options:
                     default_rows = [row_options[0]]
@@ -2972,7 +2976,7 @@ def render_cost_tab():
                     )
 
                 if selected_rows and (required_passes <= 1 or len(selected_rows) >= required_passes):
-                    consumo_sheet, err_agg = agregar_consumo_por_linhas(df_sheet, cols, selected_rows)
+                    consumo_sheet, err_agg = agregar_consumo_por_linhas(df_sheet, sheet_cols, selected_rows)
                     if err_agg:
                         st.error(err_agg)
                     else:
@@ -2988,6 +2992,7 @@ def render_cost_tab():
                         debug_matches = consumo_sheet.get("debug_matches", [])
 
                         total_ml = c_ml + w_ml + q_ml
+                        tpp_fmt = "00:00"
                         m1, m2, m3, m4, m5, m6 = st.columns(6, gap="large")
                         m1.metric("Total Color (ml/piece)", f"{c_ml:.2f}")
                         m2.metric("Total White (ml/piece)", f"{w_ml:.2f}")
@@ -3037,7 +3042,6 @@ def render_cost_tab():
                         if curing_key == "fixed_per_pass":
                             tempo_cura_min = float(passes_now) * float(cure_time_val)
                         elif curing_key == "batch_per_pass":
-                            import math
                             cycles_per_pass = int(math.ceil(float(qtd) / float(batch_size_val))) if qtd and batch_size_val else 0
                             tempo_cura_min = float(passes_now) * float(cycles_per_pass) * float(cure_time_val + cure_handling_val)
 
@@ -3130,15 +3134,15 @@ def render_cost_tab():
                         with st.expander("Preview selected rows", expanded=False):
                             preview_cols = [
                                 c for c in [
-                                    cols.get("job"),
-                                    cols.get("len"),
-                                    cols.get("color"),
-                                    cols.get("white"),
-                                    cols.get("enh"),
-                                    cols.get("img_h"),
-                                    cols.get("img_w"),
-                                    cols.get("time"),
-                                    cols.get("date"),
+                                    sheet_cols.get("job"),
+                                    sheet_cols.get("len"),
+                                    sheet_cols.get("color"),
+                                    sheet_cols.get("white"),
+                                    sheet_cols.get("enh"),
+                                    sheet_cols.get("img_h"),
+                                    sheet_cols.get("img_w"),
+                                    sheet_cols.get("time"),
+                                    sheet_cols.get("date"),
                                 ] if c
                             ]
                             st.dataframe(
@@ -3301,7 +3305,6 @@ def render_cost_tab():
                 key="cost_cure_handling_min"
             )
 
-        import math
         cycles_preview = int(math.ceil(float(qtd) / float(dryer_batch_size))) if qtd and dryer_batch_size else 0
         total_cure_preview = float(print_passes) * float(cycles_preview) * float(cure_time_min + cure_handling_min)
         st.caption(
