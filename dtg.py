@@ -2997,6 +2997,7 @@ def render_cost_tab():
                         if consumo_sheet is None:
                             st.error("Could not aggregate spreadsheet data.")
                             st.stop()
+                        assert consumo_sheet is not None
                         c_ml = float(consumo_sheet.get("cmyk_ml", 0.0))
                         w_ml = float(consumo_sheet.get("white_ml", 0.0))
                         q_ml = float(consumo_sheet.get("qfix_ml", 0.0))
