@@ -1622,7 +1622,6 @@ def render_roi_tab():
         custom_print_time_min = st.number_input(
             "Override total print time (min)",
             min_value=0.0,
-            value=_safe_float(st.session_state.get("custom_print_time_min", 0.0)),
             step=1.0,
             help="Optional: replace calculated print time with a measured total (before setup). If lower than speed implies, the app keeps the minimum based on speed.",
             key="custom_print_time_min",
@@ -2929,7 +2928,6 @@ def render_cost_tab():
 
         auto_apply_sheet = st.checkbox(
             "Auto-apply spreadsheet data to this quote",
-            value=bool(st.session_state.get("cost_auto_apply_sheet", True)),
             help="When enabled, selected jobs automatically update ink consumption for the quote.",
             key="cost_auto_apply_sheet"
         )
@@ -3195,7 +3193,6 @@ def render_cost_tab():
         print_passes = st.number_input(
             "Print passes (front/back/label)",
             min_value=1,
-            value=int(st.session_state.get("cost_print_passes", 1)),
             step=1,
             help="Use 1 for a single print, 2 for front+back, 3 for front+back+label, etc. Increases print time.",
             key="cost_print_passes"
@@ -3203,13 +3200,11 @@ def render_cost_tab():
     with mp2:
         lock_print_time = st.checkbox(
             "Lock print time override",
-            value=bool(st.session_state.get("cost_lock_print_time", False)),
             help="When enabled, spreadsheet imports will not overwrite the manual print time override.",
             key="cost_lock_print_time"
         )
         use_sheet_time_override = st.checkbox(
             "Use spreadsheet print time as base (apply efficiency)",
-            value=bool(st.session_state.get("cost_use_sheet_time_override", False)),
             help="When enabled, the spreadsheet print time is adjusted by efficiency and used as total print time.",
             key="cost_use_sheet_time_override"
         )
