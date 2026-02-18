@@ -1201,7 +1201,18 @@ def render_roi_tab():
             key="roi_dep_months"
         )
 
-        st.markdown("**Residual / Resale value (optional)**")
+    with col_blank:
+        st.subheader("5. Blank T-shirt")
+        tshirt_cost = st.number_input(
+            f"Blank cost per piece ({simbolo_base})",
+            value=5.0,
+            step=0.1,
+            help="Cost of the blank garment per piece in the base currency.",
+            key="roi_tshirt_cost"
+        )
+
+        st.write("")
+        st.markdown("#### Residual / Resale value (optional)")
         resale_currency = st.selectbox(
             "Resale value currency",
             ["USD", "BRL"],
@@ -1234,16 +1245,6 @@ def render_roi_tab():
 
         st.caption(f"Resale value in base currency: {simbolo_base} {_fmt_number(residual_value, 0)}")
         st.caption(f"Depreciable base: {simbolo_base} {_fmt_number(max(machine_value - residual_value, 0.0), 0)}")
-
-    with col_blank:
-        st.subheader("5. Blank T-shirt")
-        tshirt_cost = st.number_input(
-            f"Blank cost per piece ({simbolo_base})",
-            value=5.0,
-            step=0.1,
-            help="Cost of the blank garment per piece in the base currency.",
-            key="roi_tshirt_cost"
-        )
 
     st.markdown("---")
     st.markdown("### 6. Service & Platform Fees (Optional)")
@@ -2181,6 +2182,19 @@ def render_unit_cost_distribution(res: dict, simbolo_base: str) -> None:
         st.progress(min(max(pct, 0.0), 1.0))
 
 
+def _render_progress_bar(pct: float, color: str = "#2f6fed") -> None:
+    pct_clamped = max(0.0, min(1.0, float(pct)))
+    pct_width = pct_clamped * 100.0
+    st.markdown(
+        f"""
+        <div style="height: 8px; border-radius: 999px; background: #eef1f6; overflow: hidden; margin: 6px 0 16px;">
+          <div style="height: 100%; width: {pct_width:.2f}%; background: {color}; border-radius: 999px;"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_cost_tab():
     # -----------------------------------------------------------------
     # Session state (keeps results visible when widgets change)
@@ -2402,7 +2416,17 @@ def render_cost_tab():
             help="Useful life in months. The app converts this into an hourly and per-piece depreciation cost."
         )
 
-        st.markdown("**Residual / Resale value (optional)**")
+    with col_blank:
+        st.subheader("5. Blank T-shirt")
+        tshirt_cost = st.number_input(
+            f"Blank cost per piece ({simbolo_base})",
+            value=5.0,
+            step=0.1,
+            help="Cost of the blank garment per piece in the base currency."
+        )
+
+        st.write("")
+        st.markdown("#### Residual / Resale value (optional)")
         resale_currency = st.selectbox(
             "Resale value currency",
             ["USD", "BRL"],
@@ -2434,14 +2458,6 @@ def render_cost_tab():
 
         st.caption(f"Resale value in base currency: {simbolo_base} {_fmt_number(residual_value, 0)}")
         st.caption(f"Depreciable base: {simbolo_base} {_fmt_number(max(machine_value - residual_value, 0.0), 0)}")
-    with col_blank:
-        st.subheader("5. Blank T-shirt")
-        tshirt_cost = st.number_input(
-            f"Blank cost per piece ({simbolo_base})",
-            value=5.0,
-            step=0.1,
-            help="Cost of the blank garment per piece in the base currency."
-        )
 
     st.markdown("---")
     st.markdown("### 6. Service & Platform Fees (Optional)")
@@ -3723,7 +3739,7 @@ def render_cost_tab():
                 if sp_pp > 0:
                     st.caption(f"Including Service/Platform: {_fmt_money(simbolo_base, sp_pp)} per piece.")
 
-                pm_left, pm_right = st.columns([1.35, 0.90], gap="large")
+                pm_left, pm_right = st.columns([1.60, 0.75], gap="large")
 
                 with pm_left:
                     target_margins = [10, 20, 30, 40, 50, 60]
@@ -3738,7 +3754,7 @@ def render_cost_tab():
                         })
 
                     df_pricing = pd.DataFrame(rows)
-                    st.dataframe(df_pricing, use_container_width=True, height=220)
+                    st.dataframe(df_pricing, use_container_width=True, height=280)
 
                 with pm_right:
                     st.caption("Quick calculator")
@@ -3781,7 +3797,40 @@ def render_cost_tab():
             # ---------------------------------------------------------
             # Percentual distribution (unit cost distribution)
             # ---------------------------------------------------------
-            render_unit_cost_distribution(res, simbolo_base)
+            dist_left, dist_right = st.columns(2, gap="large")
+            with dist_left:
+                st.markdown("### Percentual distribution (sorted)")
+                df_break = _build_unit_breakdown_df(res)
+                total = float(df_break["Cost"].sum()) if not df_break.empty else 0.0
+
+                if total <= 0:
+                    st.warning("No cost components were computed yet (total = 0).")
+                else:
+                    for _, row in df_break.iterrows():
+                        item = str(row.get("Item", ""))
+                        cost = _safe_float(row.get("Cost", 0.0))
+                        pct = (cost / total) if total > 0 else 0.0
+
+                        st.write(f"{item}: {_fmt_money(simbolo_base, cost)}")
+                        st.progress(min(max(pct, 0.0), 1.0))
+            with dist_right:
+                st.markdown("### Percentual distribution (ordered)")
+                unit_total = _safe_float(res.get("custo_final_unit", 0.0))
+                if unit_total <= 0:
+                    st.info("No unit total found to compute distribution.")
+                else:
+                    order_items = ["Labor", "Design", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"]
+                    df_show = _build_unit_breakdown_df(res).set_index("Item").reindex(order_items).reset_index()
+                    df_show["Cost"] = pd.to_numeric(df_show["Cost"], errors="coerce").fillna(0.0)
+
+                    for _, row in df_show.iterrows():
+                        item = str(row["Item"]) if row.get("Item") is not None else ""
+                        cost = _safe_float(row.get("Cost", 0.0))
+                        pct = (cost / unit_total) if unit_total > 0 else 0.0
+                        pct = max(0.0, min(1.0, float(pct)))
+
+                        st.write(f"{item}: {_fmt_money(simbolo_base, cost)}")
+                        _render_progress_bar(pct, color="#3b7c57")
 
             st.markdown("### Cost Breakdown Overview")
             col_chart_a, col_chart_b = st.columns(2, gap="large")
@@ -3827,44 +3876,24 @@ def render_cost_tab():
                 st.caption("Per-piece cost breakdown including ink, blank, and allocated monthly fees.")
 
                 df_unit = _build_unit_breakdown_df(res)
-
                 base_unit = alt.Chart(df_unit).encode(
                     x=alt.X("Cost:Q", title=f"Cost per piece ({simbolo_base})", axis=alt.Axis(format=".2f")),
                     y=alt.Y("Item:N", sort="-x", title=None),
                     tooltip=[alt.Tooltip("Item:N"), alt.Tooltip("Cost:Q", format=".4f")],
                 )
-                bars_unit = base_unit.mark_bar(cornerRadius=12, size=26).encode(
+                bars_unit = base_unit.mark_bar(cornerRadius=12, size=24).encode(
                     color=alt.Color("Item:N", legend=None, scale=alt.Scale(scheme="blues"))
                 )
                 labels_unit = base_unit.mark_text(align="left", dx=6).encode(text=alt.Text("Cost:Q", format=".4f"))
 
                 st.altair_chart(
                     (bars_unit + labels_unit)
-                    .properties(height=max(260, 28 * len(df_unit)))
+                    .properties(height=max(360, 32 * len(df_unit)))
                     .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.6)
                     .configure_view(stroke=None),
                     use_container_width=True,
                 )
 
-                st.markdown("")
-                st.markdown("**Percentual distribution:**")
-
-                unit_total = _safe_float(res.get("custo_final_unit", 0.0))
-                if unit_total <= 0:
-                    st.info("No unit total found to compute distribution.")
-                else:
-                    order_items = ["Labor", "Design", "Ink", "Energy", "Depreciation", "Service/Platform", "Heat press", "T-shirt"]
-                    df_show = df_unit.set_index("Item").reindex(order_items).reset_index()
-                    df_show["Cost"] = pd.to_numeric(df_show["Cost"], errors="coerce").fillna(0.0)
-
-                    for _, row in df_show.iterrows():
-                        item = str(row["Item"]) if row.get("Item") is not None else ""
-                        cost = _safe_float(row.get("Cost", 0.0))
-                        pct = (cost / unit_total) if unit_total > 0 else 0.0
-                        pct = max(0.0, min(1.0, float(pct)))
-
-                        st.write(f"{item}: {_fmt_money(simbolo_base, cost)}")
-                        st.progress(pct)
                         # ---------------------------------------------------------
 # App entrypoint
 # ---------------------------------------------------------
