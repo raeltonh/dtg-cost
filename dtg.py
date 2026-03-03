@@ -10,6 +10,102 @@ from PIL import Image
 # Streamlit page config (must be the first Streamlit call)
 st.set_page_config(page_title="DTG Cost", layout="wide")
 
+# --- THEME / PASTEL STYLE ---
+PASTEL_CSS = """
+<style>
+:root {
+  --pastel-bg-1: #f7f5ff;
+  --pastel-bg-2: #f3fbf8;
+  --pastel-ink: #2b2b2b;
+  --pastel-muted: #6b6b6b;
+  --pastel-accent: #9ab7ff;
+  --pastel-accent-2: #ffd4e8;
+  --pastel-accent-3: #c9f0e5;
+  --pastel-card: #ffffff;
+  --pastel-border: #e6e2f1;
+}
+
+/* App background */
+.stApp {
+  background: linear-gradient(160deg, var(--pastel-bg-1) 0%, var(--pastel-bg-2) 100%);
+  color: var(--pastel-ink);
+}
+
+/* Headings */
+h1, h2, h3, h4, h5, h6 {
+  color: var(--pastel-ink);
+}
+
+/* Section captions */
+div[data-testid="stCaptionContainer"] {
+  color: var(--pastel-muted);
+}
+
+/* Cards / containers */
+div[data-testid="stMetric"] {
+  background: var(--pastel-card);
+  border: 1px solid var(--pastel-border);
+  border-radius: 12px;
+  padding: 10px 12px;
+  box-shadow: 0 4px 12px rgba(32, 33, 36, 0.06);
+}
+
+/* Inputs */
+div[data-baseweb="input"] input,
+div[data-baseweb="textarea"] textarea {
+  background: #ffffff;
+  border-radius: 10px;
+  border: 1px solid var(--pastel-border);
+}
+
+/* Selectbox, multiselect, date */
+div[data-baseweb="select"] > div {
+  background: #ffffff;
+  border-radius: 10px;
+  border: 1px solid var(--pastel-border);
+}
+
+/* Buttons */
+button[kind="primary"] {
+  background: linear-gradient(120deg, var(--pastel-accent) 0%, var(--pastel-accent-2) 100%);
+  color: #1d1d1d;
+  border: none;
+}
+button[kind="secondary"] {
+  background: #ffffff;
+  border: 1px solid var(--pastel-border);
+}
+
+/* Tabs */
+div[data-testid="stTabs"] button {
+  background: #ffffff;
+  border-radius: 10px;
+  border: 1px solid var(--pastel-border);
+}
+div[data-testid="stTabs"] button[aria-selected="true"] {
+  background: var(--pastel-accent-3);
+  border-color: #b6e6d8;
+}
+
+/* Expanders */
+div[data-testid="stExpander"] > details {
+  background: #ffffff;
+  border-radius: 12px;
+  border: 1px solid var(--pastel-border);
+}
+
+/* Dataframes */
+div[data-testid="stDataFrame"] {
+  background: #ffffff;
+  border-radius: 12px;
+  border: 1px solid var(--pastel-border);
+}
+</style>
+"""
+
+def inject_pastel_theme() -> None:
+    st.markdown(PASTEL_CSS, unsafe_allow_html=True)
+
 # --- BRANDING / LOGO ---
 BASE_DIR = Path(__file__).resolve().parent
 LOGO_PATH = BASE_DIR / "assets" / "logo.png"
@@ -25,6 +121,8 @@ def render_top_header(title_text: str) -> None:
             st.image(str(LOGO_PATH), width=LOGO_WIDTH)
 
 # --- CONFIGURAÇÕES E DADOS PADRÃO ---
+LABOR_BURDEN_DEFAULT = 0.80
+
 FATORES_COMPLEXIDADE = {
     "Simple (Logo/Chest)": {"fator_velocidade": 1.0, "consumo_ml": 1.0},
     "Standard (A4 Color)": {"fator_velocidade": 0.9, "consumo_ml": 5.0},
@@ -104,6 +202,13 @@ def extrair_consumo_de_imagem(uploaded_file):
         try:
             return float(cleaned)
         except ValueError:
+            # Fallback: extract the first numeric substring (tolerate trailing/leading junk)
+            m = re.search(r"[-+]?\d+(?:\.\d+)?", cleaned)
+            if m:
+                try:
+                    return float(m.group(0))
+                except Exception:
+                    pass
             return None
 
     def dedup_matches(matches):
@@ -218,29 +323,54 @@ def extrair_consumo_de_imagem(uploaded_file):
             if last_val is not None:
                 resultado.append({"canal": canal, "valor": last_val})
 
+        if resultado:
+            return resultado
+
+        # Relaxed fallback (handles OCR lines not aligned at line start)
+        padroes_relaxed = [
+            ("C",  rf"(?i)(?<!Total\s)C\s*{SEP}\s*([\d\.,]+)"),
+            ("M",  rf"(?i)(?<!Total\s)M\s*{SEP}\s*([\d\.,]+)"),
+            ("Y",  rf"(?i)(?<!Total\s)Y\s*{SEP}\s*([\d\.,]+)"),
+            ("K",  rf"(?i)(?<!Total\s)K\s*{SEP}\s*([\d\.,]+)"),
+            ("R",  rf"(?i)(?<!Total\s)R\s*{SEP}\s*([\d\.,]+)"),
+            ("G",  rf"(?i)(?<!Total\s)G\s*{SEP}\s*([\d\.,]+)"),
+            ("Np", rf"(?i)(?<!Total\s)N\s*p\s*{SEP}\s*([\d\.,]+)"),
+            ("Ny", rf"(?i)(?<!Total\s)N\s*y\s*{SEP}\s*([\d\.,]+)"),
+            ("Qc", rf"(?i)(?<!Total\s)Q\s*c\s*{SEP}\s*([\d\.,]+)"),
+            ("PE", rf"(?i)(?<!Total\s)P\s*E\s*{SEP}\s*([\d\.,]+)"),
+            ("W",  rf"(?i)(?<!Total\s)W\s*{SEP}\s*([\d\.,]+)"),
+            ("Qw", rf"(?i)(?<!Total\s)Q\s*w\s*{SEP}\s*([\d\.,]+)"),
+            ("PG", rf"(?i)(?<!Total\s)P\s*G\s*{SEP}\s*([\d\.,]+)"),
+        ]
+
+        for canal, padrao in padroes_relaxed:
+            last_val = None
+            for m in re.finditer(padrao, blob_text, flags=re.IGNORECASE | re.MULTILINE):
+                val = _to_float(m.group(1))
+                if val is not None:
+                    last_val = val
+            if last_val is not None:
+                resultado.append({"canal": canal, "valor": last_val})
+
         return resultado
 
-    blob = "\n".join(meta_textos)
-    total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob)
-    canais_consumo = parse_canais(blob)
+    # Prefer metadata that actually contains CPP keywords; otherwise skip to OCR
+    keywords = r"(Total\s*C|Total\s*W|Total\s*Q|Qfix|White|CMYK|Qc|Qw|PE|PG)"
+    meta_filtered = [t for t in meta_textos if re.search(keywords, str(t), flags=re.IGNORECASE)]
+    blob = "\n".join(meta_filtered) if meta_filtered else ""
 
-    # Fallback: if totals missing but we have channel values, derive totals
-    if not any([total_c, total_w, total_q, total_all]) and canais_consumo:
-        canal_map = {c["canal"]: float(c.get("valor", 0.0)) for c in canais_consumo if c.get("canal")}
+    total_c = total_w = total_q = total_all = None
+    debug_matches = []
+    canais_consumo = []
 
-        # Sum CMYK-ish channels (includes K, Ny, Np if present)
-        c_comp = sum(canal_map.get(c, 0.0) for c in ["C", "M", "Y", "K", "R", "G", "Ny", "Np"])
-        w_comp = canal_map.get("W", 0.0)
-        q_comp = sum(canal_map.get(c, 0.0) for c in ["Qc", "Qw", "PE", "PG"])
+    if blob:
+        total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob)
+        canais_consumo = parse_canais(blob)
 
-        if c_comp > 0 or w_comp > 0 or q_comp > 0:
-            total_c = c_comp
-            total_w = w_comp
-            total_q = q_comp
-            total_all = c_comp + w_comp + q_comp
-            debug_matches.append({"campo": "Derived totals", "valor": total_all, "bruto": "sum(channels)"})
+    # NOTE: we only trust explicit totals from CPP ("Total C/W/Q").
+    # We do NOT derive totals from channels or from Total (overall).
 
-    if not any([total_c, total_w, total_q, total_all]):
+    if total_c is None or total_w is None or total_q is None or total_all is None:
         # OCR is optional; we import pytesseract lazily to avoid breaking app startup when it's not installed.
         try:
             import pytesseract
@@ -289,8 +419,17 @@ def extrair_consumo_de_imagem(uploaded_file):
 
                 # IMPORTANT: keep newlines to help regex with ^ anchors
                 blob_ocr = "\n".join(meta_textos)
-                total_c, total_w, total_q, total_all, debug_matches = parse_totais(blob_ocr)
+                ocr_c, ocr_w, ocr_q, ocr_all, debug_matches = parse_totais(blob_ocr)
                 canais_consumo = parse_canais(blob_ocr)
+
+                if total_c is None and ocr_c is not None:
+                    total_c = ocr_c
+                if total_w is None and ocr_w is not None:
+                    total_w = ocr_w
+                if total_q is None and ocr_q is not None:
+                    total_q = ocr_q
+                if total_all is None and ocr_all is not None:
+                    total_all = ocr_all
 
                 if debug_matches is not None:
                     debug_matches.append({"campo": "Fonte", "valor": 0, "bruto": "OCR"})
@@ -305,18 +444,11 @@ def extrair_consumo_de_imagem(uploaded_file):
             "debug_matches": dedup_matches(debug_matches), "canais_consumo": dedup_matches(canais_consumo)
         }, None
 
-    if total_all:
-        return {
-            "cmyk_ml": total_all, "white_ml": 0.0, "qfix_ml": 0.0, "total_ml": total_all,
-            "debug_matches": dedup_matches(debug_matches), "canais_consumo": dedup_matches(canais_consumo)
-        }, None
+    # If explicit totals are not found, fail fast to avoid wrong values.
 
     # ---------------------------------------------------------
     # Friendly fallback message (avoid showing raw binary noise)
     # ---------------------------------------------------------
-    keywords = r"(Total\s*C|Total\s*W|Total\s*Q|Qfix|White|CMYK|Qc|Qw|PE|PG)"
-    meta_filtered = [t for t in meta_textos if re.search(keywords, str(t), flags=re.IGNORECASE)]
-
     preview_source = meta_filtered if meta_filtered else meta_textos
     preview_text = " ".join([str(x) for x in preview_source])
 
@@ -662,6 +794,172 @@ def render_cpp_ink_breakdown(
 
             st.altair_chart(chart_canais, use_container_width=True)
 
+def build_pdf_report(res: dict, simbolo_base: str, qtd: int, consumo_info: dict | None) -> tuple[bytes | None, str | None]:
+    """Build a one-page PDF report. Returns (pdf_bytes, error)."""
+    try:
+        from io import BytesIO
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.lib.units import cm
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+        from reportlab.graphics.shapes import Drawing
+        from reportlab.graphics.charts.barcharts import VerticalBarChart
+        from reportlab.graphics.charts.piecharts import Pie
+    except Exception as exc:
+        return None, f"PDF library not available: {exc}"
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=A4,
+        leftMargin=1.2 * cm,
+        rightMargin=1.2 * cm,
+        topMargin=1.0 * cm,
+        bottomMargin=1.0 * cm,
+    )
+    styles = getSampleStyleSheet()
+    style_h = styles["Heading2"]
+    style_h.fontSize = 12
+    style_h.leading = 14
+    style_n = styles["BodyText"]
+    style_n.fontSize = 9
+    style_n.leading = 11
+
+    story = []
+    story.append(Paragraph("DTG Cost Report", style_h))
+    story.append(Paragraph("Summary of key cost and consumption metrics.", style_n))
+    story.append(Spacer(1, 6))
+
+    unit_cost = float(res.get("custo_final_unit", 0.0))
+    total_job_cost = unit_cost * float(qtd)
+    total_time_min = float(res.get("tempo_total_min", 0.0))
+    total_time_h = total_time_min / 60.0 if total_time_min > 0 else 0.0
+
+    c_ml = None
+    w_ml = None
+    q_ml = None
+    if isinstance(consumo_info, dict):
+        c_ml = consumo_info.get("cmyk_ml")
+        w_ml = consumo_info.get("white_ml")
+        q_ml = consumo_info.get("qfix_ml")
+    else:
+        c_ml = res.get("ml_cmyk")
+        w_ml = res.get("ml_white")
+        q_ml = res.get("ml_qfix")
+
+    def _fmt_val(v):
+        if v is None:
+            return "—"
+        return f"{float(v):.2f}"
+
+    summary_data = [
+        ["Unit cost (per piece)", _fmt_money(simbolo_base, unit_cost)],
+        ["Order quantity", f"{int(qtd)} pcs"],
+        ["Total job cost", _fmt_money(simbolo_base, total_job_cost)],
+        ["Total time", f"{total_time_h:.1f} h ({total_time_min:.0f} min)"],
+        ["Total C (ml/piece)", _fmt_val(c_ml)],
+        ["Total W (ml/piece)", _fmt_val(w_ml)],
+        ["Total Q (ml/piece)", _fmt_val(q_ml)],
+    ]
+    tbl = Table(summary_data, colWidths=[8.0 * cm, 7.0 * cm])
+    tbl.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("FONT", (0, 0), (-1, -1), "Helvetica", 9),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(Paragraph("Key Summary", style_h))
+    story.append(tbl)
+    story.append(Spacer(1, 8))
+
+    # Cost breakdown table
+    df_break = _build_unit_breakdown_df(res)
+    if not df_break.empty:
+        rows = [["Item", "Per piece", "Total (job)"]]
+        for _, r in df_break.iterrows():
+            cost_pp = float(r["Cost"])
+            rows.append([
+                str(r["Item"]),
+                _fmt_money(simbolo_base, cost_pp),
+                _fmt_money(simbolo_base, cost_pp * float(qtd)),
+            ])
+        t_break = Table(rows, colWidths=[6.2 * cm, 4.2 * cm, 4.6 * cm])
+        t_break.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+            ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+            ("FONT", (0, 0), (-1, -1), "Helvetica", 8),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        story.append(Paragraph("Cost Breakdown (per piece vs total)", style_h))
+        story.append(t_break)
+        story.append(Spacer(1, 6))
+
+    # Charts: Cost per piece (bar) + Cost share (pie)
+    if not df_break.empty:
+        items = df_break["Item"].tolist()
+        costs = df_break["Cost"].astype(float).tolist()
+        max_cost = max(costs) if costs else 1.0
+
+        drawing = Drawing(500, 170)
+        bar = VerticalBarChart()
+        bar.x = 10
+        bar.y = 20
+        bar.height = 130
+        bar.width = 260
+        bar.data = [costs]
+        bar.categoryAxis.categoryNames = items
+        bar.valueAxis.valueMin = 0
+        bar.valueAxis.valueMax = max_cost * 1.2 if max_cost > 0 else 1
+        bar.valueAxis.valueStep = max_cost / 4 if max_cost > 0 else 1
+        bar.barWidth = 10
+        bar.groupSpacing = 6
+        bar.bars[0].fillColor = colors.HexColor("#3b7c57")
+        bar.categoryAxis.labels.boxAnchor = "n"
+        bar.categoryAxis.labels.fontSize = 6
+        bar.valueAxis.labels.fontSize = 6
+        drawing.add(bar)
+
+        pie = Pie()
+        pie.x = 300
+        pie.y = 20
+        pie.width = 160
+        pie.height = 130
+        pie.data = costs
+        pie.labels = items
+        pie.sideLabels = 1
+        pie.simpleLabels = 0
+        pie.slices.strokeWidth = 0.5
+        pie.slices.fontSize = 6
+        drawing.add(pie)
+
+        story.append(Paragraph("Cost Share (per piece) and Cost by Item", style_h))
+        story.append(drawing)
+        story.append(Spacer(1, 6))
+
+    # Key parameters
+    params = [
+        ["Ink / ml", _fmt_money(simbolo_base, float(res.get("preco_tinta_ml_base", 0.0)))],
+        ["Fixation / ml", _fmt_money(simbolo_base, float(res.get("preco_fix_ml_base", 0.0)))],
+        ["Energy / kWh", _fmt_money(simbolo_base, float(res.get("custo_energia_kwh", 0.0)))],
+        ["Labor / hour", _fmt_money(simbolo_base, float(res.get("custo_hora_equipe", 0.0)))],
+        ["Depreciation / hour", _fmt_money(simbolo_base, float(res.get("custo_dep_hour", 0.0)))],
+    ]
+    t_params = Table(params, colWidths=[7.0 * cm, 8.0 * cm])
+    t_params.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.lightgrey),
+        ("FONT", (0, 0), (-1, -1), "Helvetica", 8),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    story.append(Paragraph("Key Cost Parameters", style_h))
+    story.append(t_params)
+
+    doc.build(story)
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes, None
+
 def calcular_custo_total(
     qtd_pedido,
     velocidade_nominal,
@@ -677,6 +975,7 @@ def calcular_custo_total(
     fixation_price_ml_manual,
     consumo_override,
     fixation_percent,
+    fixation_ratio,
     custo_energia_kwh,
     moeda_base,
     horas_mes,
@@ -807,10 +1106,15 @@ def calcular_custo_total(
         if preco_litro_base is None: return "Error: invalid FX rate."
         custo_tinta_ml_base = preco_litro_base / 1000
 
+    dilution_ratio = float(fixation_ratio) if fixation_ratio and float(fixation_ratio) > 0 else 0.0
+    dilution_factor = 1.0 + dilution_ratio
+
     if fixation_price_ml_manual is None or float(fixation_price_ml_manual) <= 0:
-        custo_fix_ml_base = custo_tinta_ml_base
+        custo_fix_ml_concentrate = custo_tinta_ml_base
     else:
-        custo_fix_ml_base = float(fixation_price_ml_manual)
+        custo_fix_ml_concentrate = float(fixation_price_ml_manual)
+
+    custo_fix_ml_base = custo_fix_ml_concentrate / dilution_factor
 
     custo_tinta_unit = (consumo_ml * custo_tinta_ml_base) + (fix_ml * custo_fix_ml_base)
     
@@ -953,6 +1257,8 @@ def calcular_custo_total(
         "ml_qfix": consumo_override["qfix_ml"] if consumo_override else None,
         "preco_tinta_ml_base": custo_tinta_ml_base, "preco_tinta_litro_base": preco_litro_base,
         "preco_fix_ml_base": custo_fix_ml_base,
+        "preco_fix_ml_concentrate": custo_fix_ml_concentrate,
+        "fixation_ratio": dilution_ratio,
         "horas_mes": horas_mes,
         "custo_hora_equipe": custo_hora_equipe,
         "custo_hora_designer": custo_hora_designer,
@@ -988,6 +1294,10 @@ def render_roi_tab():
         st.session_state["roi_consumo_override"] = None
     if "roi_consumo_file" not in st.session_state:
         st.session_state["roi_consumo_file"] = None
+    if "roi_sheet_time_per_piece_min" not in st.session_state:
+        st.session_state["roi_sheet_time_per_piece_min"] = 0.0
+    if "roi_sheet_selected_jobs" not in st.session_state:
+        st.session_state["roi_sheet_selected_jobs"] = []
 
     st.markdown("### Cost Inputs (ROI)")
     c_econ, c_insumo, c_team = st.columns(3, gap="large")
@@ -1096,12 +1406,29 @@ def render_roi_tab():
                     fixation_price_ml_manual = (float(fixation_liter_price) * float(dolar)) / 1000.0
                 elif fixation_currency == "BRL" and moeda_base == "USD":
                     fixation_price_ml_manual = (float(fixation_liter_price) / float(dolar)) / 1000.0
+        if fixation_price_ml_manual is not None:
+            st.caption(f"Fixation price (per ml, concentrate): {_fmt_money(simbolo_base, fixation_price_ml_manual)}")
+        fixation_ratio_label = st.selectbox(
+            "Fixation dilution ratio",
+            ["1:10", "1:5"],
+            index=0,
+            help="Dilution ratio for fixation. Example: 1:10 = 1L fixation + 10L water (11L total).",
+            key="roi_fixation_ratio"
+        )
+        fixation_ratio = 10.0 if fixation_ratio_label == "1:10" else 5.0
+        st.caption(f"Fixation dilution factor: {1 + fixation_ratio:.0f}x (effective price per ml is divided by this factor).")
+        if fixation_price_ml_manual is not None:
+            fix_price_ml_effective = float(fixation_price_ml_manual) / (1.0 + float(fixation_ratio))
+            st.caption(f"Fixation price (per ml, diluted): {_fmt_money(simbolo_base, fix_price_ml_effective)}")
         last_res = st.session_state.get("roi_last_res")
         if isinstance(last_res, dict):
             fix_ml = _safe_float(last_res.get("ml_fixation", 0.0))
             fix_price_ml = _safe_float(last_res.get("preco_fix_ml_base", 0.0))
+            fix_ratio = _safe_float(last_res.get("fixation_ratio", 0.0))
             fix_cost = fix_ml * fix_price_ml
-            st.caption(f"Fixation price (per ml): {_fmt_money(simbolo_base, fix_price_ml)}")
+            st.caption(
+                f"Fixation price (per ml, diluted {int(1 + fix_ratio)}x): {_fmt_money(simbolo_base, fix_price_ml)}"
+            )
             st.caption(
                 f"Fixation (per piece): {_fmt_number(fix_ml, 2)} ml = {_fmt_money(simbolo_base, fix_cost)}"
             )
@@ -1130,24 +1457,8 @@ def render_roi_tab():
             key="roi_sal_designer"
         )
 
-        design_time_hours = st.number_input(
-            "Estimated design effort for this order (hours)",
-            value=0.0,
-            step=0.5,
-            help=(
-                "Total design/prepress effort for this order (in hours, not per-piece). "
-                "The value is allocated across the order quantity and added to the unit cost."
-            ),
-            key="roi_design_time_hours"
-        )
-        encargos = st.number_input(
-            "Labor burden / overhead (%)",
-            value=0.80,
-            step=0.05,
-            help="Extra labor burden over base salaries (benefits, taxes, HR overhead). Example: 0.80 = +80% over base salaries.",
-            key="roi_encargos"
-        )
-        st.caption("Tip: 0.80 = +80% overhead over base salaries.")
+        design_time_hours = 0.0
+        encargos = LABOR_BURDEN_DEFAULT
         horas_mes = st.number_input(
             "Hours/month",
             value=220,
@@ -1441,7 +1752,7 @@ def render_roi_tab():
         "• Manual: you type CMYK/White/Qfix ml per piece.\n"
         "• File (PNG/TIFF): the app extracts Total C/W/Q from a CPP export (with OCR fallback)."
     )
-    tab_p, tab_m, tab_a, tab_s = st.tabs(["Default", "Manual", "File (PNG/TIFF)", "Spreadsheet (XLSX)"])
+    tab_p, tab_m, tab_a, tab_s = st.tabs(["Default", "Manual", "File (PNG/TIFF)", "Spreadsheet from Konnect"])
 
     with tab_p:
         complexidade = st.selectbox(
@@ -1569,6 +1880,97 @@ def render_roi_tab():
             else:
                 st.session_state["roi_calc_mode"] = "arquivo"
                 st.session_state["roi_consumo_override"] = st.session_state.get("roi_consumo_file")
+    with tab_s:
+        st.caption("Upload the XLSX exported from Job Consumption / Ink Consumption report.")
+
+        sheet_file = st.file_uploader(
+            "Spreadsheet from Konnect",
+            type=["xlsx", "xls"],
+            key="roi_up_sheet",
+            help="Upload the Job Consumption export. Then select the Job Name(s) from column A."
+        )
+
+        if sheet_file:
+            df_sheet, sheet_cols, err_sheet = extrair_consumo_de_planilha(sheet_file)
+            if err_sheet:
+                st.error(err_sheet)
+            elif df_sheet is None or df_sheet.empty:
+                st.error("Spreadsheet loaded but has no data rows.")
+            else:
+                if sheet_cols is None:
+                    st.error("Spreadsheet columns could not be parsed.")
+                    st.stop()
+                assert df_sheet is not None
+                assert sheet_cols is not None
+
+                if sheet_cols.get("job_fallback"):
+                    st.info("Job Name column not found. Using column A as the job selector.")
+
+                job_col = sheet_cols["job"]
+                job_label = "Job Name / column A" if not sheet_cols.get("job_fallback") else "column A"
+
+                def _label_for_row_roi(idx: int) -> str:
+                    row = df_sheet.loc[idx]
+                    job_name_raw = str(row.get(job_col, "")).strip()
+                    job_name = job_name_raw
+                    if len(job_name) > 40:
+                        job_name = job_name[:37] + "..."
+                    time_val = row.get(sheet_cols.get("time")) if sheet_cols.get("time") else ""
+                    date_val = row.get(sheet_cols.get("date")) if sheet_cols.get("date") else ""
+                    return f"{job_name} | Time {time_val} | Date {date_val}"
+
+                row_options = df_sheet.index.tolist()
+                default_rows = st.session_state.get("roi_sheet_selected_jobs") or []
+                if not default_rows and row_options:
+                    default_rows = [row_options[0]]
+
+                selected_rows = st.multiselect(
+                    f"Select row(s) ({job_label})",
+                    options=row_options,
+                    default=default_rows,
+                    format_func=_label_for_row_roi,
+                    key="roi_sheet_jobs"
+                )
+
+                if selected_rows:
+                    consumo_sheet, err_agg = agregar_consumo_por_linhas(df_sheet, sheet_cols, selected_rows)
+                    if err_agg:
+                        st.error(err_agg)
+                    else:
+                        if consumo_sheet is None:
+                            st.error("Could not aggregate spreadsheet data.")
+                            st.stop()
+                        assert consumo_sheet is not None
+                        c_ml = float(consumo_sheet.get("cmyk_ml", 0.0))
+                        w_ml = float(consumo_sheet.get("white_ml", 0.0))
+                        q_ml = float(consumo_sheet.get("qfix_ml", 0.0))
+                        tpp = float(consumo_sheet.get("sheet_time_per_piece_min", 0.0))
+
+                        total_ml = c_ml + w_ml + q_ml
+                        m1, m2, m3, m4 = st.columns(4, gap="large")
+                        m1.metric("Total Color (ml/piece)", f"{c_ml:.2f}")
+                        m2.metric("Total White (ml/piece)", f"{w_ml:.2f}")
+                        m3.metric("Total Enhancers (ml/piece)", f"{q_ml:.2f}")
+                        m4.metric("Total Ink (ml/piece)", f"{total_ml:.2f}")
+                        if tpp > 0:
+                            st.caption(f"Print time (min/piece): {tpp:.2f}")
+
+                        st.session_state["roi_sheet_time_per_piece_min"] = tpp
+                        st.session_state["roi_sheet_selected_jobs"] = list(selected_rows)
+                        st.session_state["roi_consumo_override"] = {
+                            "cmyk_ml": c_ml,
+                            "white_ml": w_ml,
+                            "qfix_ml": q_ml,
+                            "total_ml": total_ml,
+                            "debug_matches": consumo_sheet.get("debug_matches", []),
+                            "canais_consumo": [],
+                        }
+
+        if st.button("Calculate (Spreadsheet)", type="primary", key="roi_calc_s"):
+            if st.session_state.get("roi_consumo_override") is None:
+                st.error("Upload a valid spreadsheet and select at least one row before calculating.")
+            else:
+                st.session_state["roi_calc_mode"] = "planilha"
 
     st.markdown("#### Production parameters")
     sp1, sp2, sp3 = st.columns(3, gap="large")
@@ -1607,8 +2009,8 @@ def render_roi_tab():
         )
     with mp2:
         # If using spreadsheet-based consumption, auto-suggest total print time
-        if st.session_state.get("calc_mode") == "planilha":
-            tpp = _safe_float(st.session_state.get("sheet_time_per_piece_min", 0.0))
+        if st.session_state.get("roi_calc_mode") == "planilha":
+            tpp = _safe_float(st.session_state.get("roi_sheet_time_per_piece_min", 0.0))
             qtd_preview = _safe_float(st.session_state.get("roi_monthly_volume", 0.0))
             if tpp > 0 and float(qtd_preview) > 0:
                 suggested_total = float(tpp) * float(qtd_preview) * float(print_passes)
@@ -1680,7 +2082,7 @@ def render_roi_tab():
             if calc_mode in ("padrao", "manual"):
                 st.error(
                     "Print passes > 1 require multiple consumption sources. "
-                    "Use File (PNG/TIFF) or Spreadsheet (XLSX) and provide one file/row per pass."
+                    "Use File (PNG/TIFF) or Spreadsheet from Konnect and provide one file/row per pass."
                 )
                 return
 
@@ -1699,6 +2101,7 @@ def render_roi_tab():
             fixation_price_ml_manual,
             consumo_override,
             fixation_percent,
+            fixation_ratio,
             kwh,
             moeda_base,
             horas_mes,
@@ -2320,7 +2723,19 @@ def render_cost_tab():
                 fix_price_ml_manual = float(fixation_liter_price) / 1000.0
 
         if fix_price_ml_manual is not None:
-            st.caption(f"Fixation price (per ml): {_fmt_money(simbolo_base, fix_price_ml_manual)}")
+            st.caption(f"Fixation price (per ml, concentrate): {_fmt_money(simbolo_base, fix_price_ml_manual)}")
+
+        fixation_ratio_label = st.selectbox(
+            "Fixation dilution ratio",
+            ["1:10", "1:5"],
+            index=0,
+            help="Dilution ratio for fixation. Example: 1:10 = 1L fixation + 10L water (11L total)."
+        )
+        fixation_ratio = 10.0 if fixation_ratio_label == "1:10" else 5.0
+        st.caption(f"Fixation dilution factor: {1 + fixation_ratio:.0f}x (effective price per ml is divided by this factor).")
+        if fix_price_ml_manual is not None:
+            fix_price_ml_effective = float(fix_price_ml_manual) / (1.0 + float(fixation_ratio))
+            st.caption(f"Fixation price (per ml, diluted): {_fmt_money(simbolo_base, fix_price_ml_effective)}")
 
     with c_team:
         st.subheader("3. Labor")
@@ -2353,14 +2768,7 @@ def render_cost_tab():
                 "The value is allocated across the order quantity and added to the unit cost."
             )
         )
-        encargos = st.number_input(
-            "Labor burden / overhead (%)",
-            value=0.80,
-            step=0.05,
-            help="Extra labor burden over base salaries (benefits, taxes, HR overhead). Example: 0.80 = +80% over base salaries.",
-            key="cost_encargos"
-        )
-        st.caption("Tip: 0.80 = +80% overhead over base salaries.")
+        encargos = LABOR_BURDEN_DEFAULT
         horas_mes = st.number_input(
             "Hours/month",
             value=220,
@@ -2776,7 +3184,7 @@ def render_cost_tab():
         "• Manual: you type CMYK/White/Qfix ml per piece.\n"
         "• File (PNG/TIFF): the app extracts Total C/W/Q from a CPP export (with OCR fallback)."
     )
-    tab_p, tab_m, tab_a, tab_s = st.tabs(["Default", "Manual", "File (PNG/TIFF)", "Spreadsheet (XLSX)"])
+    tab_p, tab_m, tab_a, tab_s = st.tabs(["Default", "Manual", "File (PNG/TIFF)", "Spreadsheet from Konnect"])
 
     with tab_p:
         st.info("Uses the default consumption for the selected complexity.")
@@ -2933,7 +3341,7 @@ def render_cost_tab():
         )
 
         sheet_file = st.file_uploader(
-            "Spreadsheet (.xlsx)",
+            "Spreadsheet from Konnect",
             type=["xlsx", "xls"],
             key="cost_up_sheet",
             help="Upload the Job Consumption export. Then select the Job Name(s) from column A."
@@ -3353,6 +3761,7 @@ def render_cost_tab():
             fix_price_ml_manual,
             consumo_override,
             fixation_percent,
+            fixation_ratio,
             kwh,
             moeda_base,
             horas_mes,
@@ -3890,10 +4299,32 @@ def render_cost_tab():
                     use_container_width=True,
                 )
 
+            st.markdown("---")
+            st.subheader("PDF Report")
+            st.caption("One-page summary with key costs, totals, and charts.")
+            consumo_info = (
+                st.session_state.get("consumo_file")
+                or st.session_state.get("consumo_override")
+                or None
+            )
+            pdf_bytes, pdf_err = build_pdf_report(res, simbolo_base, int(qtd), consumo_info)
+            if pdf_err:
+                st.error(pdf_err)
+            elif pdf_bytes is None:
+                st.error("PDF generation failed. No data returned.")
+            else:
+                st.download_button(
+                    "Download PDF report",
+                    data=pdf_bytes,
+                    file_name="dtg_report.pdf",
+                    mime="application/pdf",
+                )
+
                         # ---------------------------------------------------------
 # App entrypoint
 # ---------------------------------------------------------
 def main():
+    inject_pastel_theme()
     render_top_header("DTG Cost")
     tab_cost, tab_roi = st.tabs(["Cost", "ROI / Payback"])
     with tab_cost:
