@@ -2503,6 +2503,444 @@ def render_roi_tab():
             st.metric("NPV", _fmt_money(simbolo_base, npv))
         else:
             st.info("Set a valid horizon to compute NPV.")
+
+
+def render_compare_tab():
+    st.markdown("### Digital vs Screen Printing")
+    st.caption("Compare unit cost and total cost for DTG (digital) vs screen printing.")
+
+    st.markdown("#### Scenario Inputs")
+    c0, c1, c2, c3 = st.columns(4, gap="large")
+    with c0:
+        moeda_base = st.selectbox(
+            "Base currency",
+            ["USD", "BRL"],
+            0,
+            format_func=lambda v: "US$ (USD)" if v == "USD" else "R$ (BRL)",
+            help="Currency used for all inputs in this tab."
+        )
+        simbolo_base = "US$" if moeda_base == "USD" else "R$"
+        qty = st.number_input(
+            "Quantity",
+            min_value=1,
+            value=1000,
+            step=50,
+            help="Order size used for the comparison."
+        )
+    with c1:
+        colors = st.number_input(
+            "Screen colors",
+            min_value=1,
+            value=7,
+            step=1,
+            help="Number of screen colors used in screen printing."
+        )
+        screen_labor_rate = st.number_input(
+            f"Screen labor rate ({simbolo_base}/h)",
+            min_value=0.0,
+            value=15.0,
+            step=1.0,
+            help="Loaded labor cost per hour for screen printing."
+        )
+        screen_cost_per_color = st.number_input(
+            f"Screen cost per color ({simbolo_base})",
+            min_value=0.0,
+            value=120.0,
+            step=5.0,
+            help="Screen/frame cost per color."
+        )
+        setup_time_per_color = st.number_input(
+            "Setup time per color (min)",
+            min_value=0.0,
+            value=10.0,
+            step=1.0,
+            help="Setup time per color for screen printing."
+        )
+    with c2:
+        screen_speed = st.number_input(
+            "Screen print speed (pcs/h)",
+            min_value=1.0,
+            value=250.0,
+            step=10.0,
+            help="Nominal screen printing speed."
+        )
+        utilization = st.slider(
+            "Utilization",
+            0.30, 1.00, 0.85,
+            help="Operational utilization factor."
+        )
+        ink_ml_per_piece = st.number_input(
+            "Screen ink (ml per piece)",
+            min_value=0.0,
+            value=2.0,
+            step=0.1,
+            help="Average ink consumption for screen printing."
+        )
+        ink_price_ml = st.number_input(
+            f"Screen ink price per ml ({simbolo_base})",
+            min_value=0.0,
+            value=0.13,
+            step=0.01,
+            format="%.4f",
+            help="Ink price per ml for screen printing."
+        )
+    with c3:
+        screen_kw = st.number_input(
+            "Screen equipment power (kW)",
+            min_value=0.0,
+            value=1.0,
+            step=0.1,
+            help="Average power consumption of screen equipment."
+        )
+        include_blank = st.checkbox(
+            "Include blank T-shirt cost",
+            value=True,
+            help="Adds blank cost to screen printing to match the DTG cost base."
+        )
+        blank_cost = st.number_input(
+            f"Blank cost per piece ({simbolo_base})",
+            min_value=0.0,
+            value=5.0,
+            step=0.1,
+            help="Blank garment cost per piece."
+        ) if include_blank else 0.0
+        st.caption(f"Blank cost used: {_fmt_money(simbolo_base, blank_cost)}")
+
+    st.markdown("#### Digital (DTG) Inputs")
+    d1, d2, d3, d4 = st.columns(4, gap="large")
+    with d1:
+        digital_speed = st.number_input(
+            "DTG speed (pcs/h)",
+            min_value=1.0,
+            value=120.0,
+            step=5.0,
+            help="Nominal DTG speed."
+        )
+        digital_eff = st.slider(
+            "DTG efficiency",
+            0.3, 1.0, 0.70,
+            help="Real-world efficiency for DTG."
+        )
+        digital_setup_min = st.number_input(
+            "DTG setup (min)",
+            min_value=0.0,
+            value=15.0,
+            step=1.0,
+            help="Setup time for DTG per job."
+        )
+    with d2:
+        labor_rate_hour = st.number_input(
+            f"DTG labor rate ({simbolo_base}/h)",
+            min_value=0.0,
+            value=15.0,
+            step=1.0,
+            help="Loaded labor cost per hour for DTG."
+        )
+        energy_kwh_cost = st.number_input(
+            f"Energy cost ({simbolo_base}/kWh)",
+            min_value=0.0,
+            value=0.85,
+            step=0.01,
+            help="Energy price per kWh."
+        )
+        digital_kw = st.number_input(
+            "DTG power (kW)",
+            min_value=0.0,
+            value=3.5,
+            step=0.1,
+            help="Average DTG power consumption."
+        )
+    with d3:
+        dtg_ink_ml = st.number_input(
+            "DTG ink (ml per piece)",
+            min_value=0.0,
+            value=6.0,
+            step=0.1,
+            help="Total DTG ink per piece (base ink)."
+        )
+        dtg_ink_price_ml = st.number_input(
+            f"DTG ink price per ml ({simbolo_base})",
+            min_value=0.0,
+            value=0.16,
+            step=0.01,
+            format="%.4f",
+            help="Ink price per ml for DTG."
+        )
+        fixation_percent = st.number_input(
+            "Fixation (%)",
+            min_value=0.0,
+            value=10.0,
+            step=0.5,
+            help="Fixation as a percentage of DTG ink."
+        )
+    with d4:
+        fixation_price_ml = st.number_input(
+            f"Fixation price per ml ({simbolo_base})",
+            min_value=0.0,
+            value=0.16,
+            step=0.01,
+            format="%.4f",
+            help="Fixation price per ml (use same as ink if unsure)."
+        )
+        extra_digital_per_piece = st.number_input(
+            f"Extra digital cost per piece ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=0.01,
+            help="Optional extra adders per piece (maintenance, fees)."
+        )
+
+    st.markdown("#### Equipment, Depreciation & Service")
+    e1, e2, e3, e4 = st.columns(4, gap="large")
+    with e1:
+        hours_month = st.number_input(
+            "Hours per month",
+            min_value=1.0,
+            value=220.0,
+            step=10.0,
+            help="Used to convert monthly depreciation/service to hourly."
+        )
+        dtg_machine_value = st.number_input(
+            f"DTG machine value ({simbolo_base})",
+            min_value=0.0,
+            value=100000.0,
+            step=1000.0,
+            help="Acquisition value used for depreciation."
+        )
+        dtg_residual_value = st.number_input(
+            f"DTG resale value ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=1000.0,
+            help="Expected resale value to reduce depreciation base."
+        )
+    with e2:
+        dtg_dep_months = st.number_input(
+            "DTG depreciation (months)",
+            min_value=1,
+            value=36,
+            step=1,
+            help="Useful life in months."
+        )
+        dtg_service_monthly = st.number_input(
+            f"DTG after-sales / service (per month) ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help="Monthly service/after-sales cost."
+        )
+    with e3:
+        screen_machine_value = st.number_input(
+            f"Screen equipment value ({simbolo_base})",
+            min_value=0.0,
+            value=30000.0,
+            step=1000.0,
+            help="Acquisition value used for depreciation."
+        )
+        screen_residual_value = st.number_input(
+            f"Screen resale value ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=1000.0,
+            help="Expected resale value to reduce depreciation base."
+        )
+    with e4:
+        screen_dep_months = st.number_input(
+            "Screen depreciation (months)",
+            min_value=1,
+            value=36,
+            step=1,
+            help="Useful life in months."
+        )
+        screen_service_monthly = st.number_input(
+            f"Screen after-sales / service (per month) ({simbolo_base})",
+            min_value=0.0,
+            value=0.0,
+            step=100.0,
+            help="Monthly service/after-sales cost."
+        )
+        st.caption("Depreciation and service are allocated by job hours.")
+
+    st.markdown("#### Screen Printing Inputs")
+    st.caption("Screen labor rate only affects setup + print time.")
+
+    st.markdown("#### Volume Scales")
+    volumes_raw = st.text_input(
+        "Volume list (pcs)",
+        value="100, 200, 300, 400",
+        help="Comma-separated list of quantities to compare."
+    )
+    volumes = []
+    for part in str(volumes_raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            v = int(float(part))
+            if v > 0:
+                volumes.append(v)
+        except Exception:
+            continue
+    if not volumes:
+        volumes = [100, 200, 300, 400]
+
+    st.markdown("#### Cost Comparison")
+    eff_speed = float(screen_speed) * float(utilization)
+    eff_speed = eff_speed if eff_speed > 0 else 1.0
+
+    # Digital cost model
+    dtg_eff_speed = float(digital_speed) * float(digital_eff)
+    dtg_eff_speed = dtg_eff_speed if dtg_eff_speed > 0 else 1.0
+    qty_f = float(qty)
+    dtg_setup_hours = float(digital_setup_min) / 60.0
+    dtg_print_hours = qty_f / dtg_eff_speed
+    dtg_job_hours = dtg_setup_hours + dtg_print_hours
+    dtg_dep_base = max(float(dtg_machine_value) - float(dtg_residual_value), 0.0)
+    dtg_dep_hour = (dtg_dep_base / float(dtg_dep_months) / float(hours_month)) if dtg_dep_months > 0 and hours_month > 0 else 0.0
+    dtg_dep_cost = dtg_dep_hour * dtg_job_hours
+    dtg_service_hour = (float(dtg_service_monthly) / float(hours_month)) if hours_month > 0 else 0.0
+    dtg_service_cost = dtg_service_hour * dtg_job_hours
+    dtg_labor_cost = (dtg_setup_hours + dtg_print_hours) * float(labor_rate_hour)
+    dtg_energy_cost = dtg_print_hours * float(digital_kw) * float(energy_kwh_cost)
+    dtg_fix_ml = float(dtg_ink_ml) * (float(fixation_percent) / 100.0)
+    dtg_ink_cost = qty_f * float(dtg_ink_ml) * float(dtg_ink_price_ml)
+    dtg_fix_cost = qty_f * float(dtg_fix_ml) * float(fixation_price_ml)
+    dtg_blank_cost = qty_f * float(blank_cost)
+    dtg_extra_cost = qty_f * float(extra_digital_per_piece)
+
+    digital_total = (
+        dtg_labor_cost
+        + dtg_energy_cost
+        + dtg_ink_cost
+        + dtg_fix_cost
+        + dtg_blank_cost
+        + dtg_extra_cost
+        + dtg_dep_cost
+        + dtg_service_cost
+    )
+    digital_unit_cost = (digital_total / qty_f) if qty_f > 0 else 0.0
+
+    setup_hours = (float(setup_time_per_color) * float(colors)) / 60.0
+    print_hours = qty_f / eff_speed
+    screen_job_hours = setup_hours + print_hours
+    screen_dep_base = max(float(screen_machine_value) - float(screen_residual_value), 0.0)
+    screen_dep_hour = (screen_dep_base / float(screen_dep_months) / float(hours_month)) if screen_dep_months > 0 and hours_month > 0 else 0.0
+    screen_dep_cost = screen_dep_hour * screen_job_hours
+    screen_service_hour = (float(screen_service_monthly) / float(hours_month)) if hours_month > 0 else 0.0
+    screen_service_cost = screen_service_hour * screen_job_hours
+
+    setup_labor_cost = setup_hours * screen_labor_rate
+    print_labor_cost = print_hours * screen_labor_rate
+    screen_cost_total = float(colors) * float(screen_cost_per_color)
+    ink_cost_total = qty_f * float(ink_ml_per_piece) * float(ink_price_ml)
+    energy_cost_total = print_hours * float(screen_kw) * float(energy_kwh_cost)
+    blank_cost_total = qty_f * float(blank_cost)
+
+    screen_total = (
+        setup_labor_cost
+        + print_labor_cost
+        + screen_cost_total
+        + ink_cost_total
+        + energy_cost_total
+        + blank_cost_total
+        + screen_dep_cost
+        + screen_service_cost
+    )
+    screen_unit = (screen_total / qty_f) if qty_f > 0 else 0.0
+
+    s1, s2, s3 = st.columns(3, gap="large")
+    s1.metric("Digital unit cost", _fmt_money(simbolo_base, digital_unit_cost))
+    s2.metric("Screen unit cost", _fmt_money(simbolo_base, screen_unit))
+    s3.metric("Difference (Screen - Digital)", _fmt_money(simbolo_base, screen_unit - digital_unit_cost))
+
+    t1, t2, t3 = st.columns(3, gap="large")
+    t1.metric("Digital total", _fmt_money(simbolo_base, digital_total))
+    t2.metric("Screen total", _fmt_money(simbolo_base, screen_total))
+    t3.metric("Total difference", _fmt_money(simbolo_base, screen_total - digital_total))
+
+    fixed_screen = setup_labor_cost + screen_cost_total
+    var_screen_unit = (
+        print_labor_cost + ink_cost_total + energy_cost_total + blank_cost_total
+    ) / qty_f if qty_f > 0 else 0.0
+
+    if digital_unit_cost > var_screen_unit:
+        breakeven_qty = fixed_screen / (digital_unit_cost - var_screen_unit) if (digital_unit_cost - var_screen_unit) > 0 else None
+    else:
+        breakeven_qty = None
+
+    if breakeven_qty and breakeven_qty > 0:
+        st.success(f"Break-even volume ≈ {int(breakeven_qty)} pcs (screen becomes cheaper above this).")
+    else:
+        st.warning("No break-even found with current inputs (digital is cheaper at all volumes or costs overlap).")
+
+    # Volume table + chart
+    rows = []
+    for v in volumes:
+        v_f = float(v)
+        setup_hours_v = setup_hours
+        print_hours_v = v_f / eff_speed
+
+        setup_labor_cost_v = setup_hours_v * labor_rate_hour
+        print_labor_cost_v = print_hours_v * labor_rate_hour
+        screen_cost_total_v = float(colors) * float(screen_cost_per_color)
+        ink_cost_total_v = v_f * float(ink_ml_per_piece) * float(ink_price_ml)
+        energy_cost_total_v = print_hours_v * float(screen_kw) * float(energy_kwh_cost)
+        blank_cost_total_v = v_f * float(blank_cost)
+
+        screen_total_v = (
+            setup_labor_cost_v
+            + print_labor_cost_v
+            + screen_cost_total_v
+            + ink_cost_total_v
+            + energy_cost_total_v
+            + blank_cost_total_v
+        )
+        digital_total_v = float(digital_unit_cost) * v_f
+        rows.append({
+            "Volume": int(v),
+            "Digital Total": digital_total_v,
+            "Screen Total": screen_total_v,
+            "Digital Unit": digital_total_v / v_f if v_f > 0 else 0.0,
+            "Screen Unit": screen_total_v / v_f if v_f > 0 else 0.0,
+        })
+
+    df_vol = pd.DataFrame(rows)
+    if not df_vol.empty:
+        st.markdown("#### Volume Comparison")
+        df_show = df_vol.copy()
+        df_show["Digital Total"] = df_show["Digital Total"].apply(lambda v: _fmt_money(simbolo_base, float(v)))
+        df_show["Screen Total"] = df_show["Screen Total"].apply(lambda v: _fmt_money(simbolo_base, float(v)))
+        df_show["Digital Unit"] = df_show["Digital Unit"].apply(lambda v: _fmt_money(simbolo_base, float(v)))
+        df_show["Screen Unit"] = df_show["Screen Unit"].apply(lambda v: _fmt_money(simbolo_base, float(v)))
+        st.dataframe(df_show, use_container_width=True, height=220)
+
+        chart_df = df_vol.melt("Volume", var_name="Series", value_name="Cost")
+        chart_df = chart_df[chart_df["Series"].isin(["Digital Total", "Screen Total"])]
+        chart = (
+            alt.Chart(chart_df)
+            .mark_line(point=True, strokeWidth=3)
+            .encode(
+                x=alt.X("Volume:Q", title="Volume (pcs)"),
+                y=alt.Y("Cost:Q", title=f"Total cost ({simbolo_base})"),
+                color=alt.Color("Series:N", legend=alt.Legend(title=None)),
+                tooltip=[
+                    alt.Tooltip("Volume:Q"),
+                    alt.Tooltip("Series:N"),
+                    alt.Tooltip("Cost:Q", format=".2f"),
+                ],
+            )
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+    with st.expander("Screen cost breakdown", expanded=False):
+        st.write(f"Screens: {_fmt_money(simbolo_base, screen_cost_total)}")
+        st.write(f"Setup labor: {_fmt_money(simbolo_base, setup_labor_cost)}")
+        st.write(f"Print labor: {_fmt_money(simbolo_base, print_labor_cost)}")
+        st.write(f"Ink: {_fmt_money(simbolo_base, ink_cost_total)}")
+        st.write(f"Energy: {_fmt_money(simbolo_base, energy_cost_total)}")
+        st.write(f"Blank: {_fmt_money(simbolo_base, blank_cost_total)}")
 #
 # ---------------------------------------------------------
 # Helpers: Unit cost breakdown rendering (robust + readable)
@@ -4326,11 +4764,13 @@ def render_cost_tab():
 def main():
     inject_pastel_theme()
     render_top_header("DTG Cost")
-    tab_cost, tab_roi = st.tabs(["Cost", "ROI / Payback"])
+    tab_cost, tab_roi, tab_compare = st.tabs(["Cost", "ROI / Payback", "Digital vs Screen"])
     with tab_cost:
         render_cost_tab()
     with tab_roi:
         render_roi_tab()
+    with tab_compare:
+        render_compare_tab()
 
 # Streamlit runs top-to-bottom on each interaction.
 main()
