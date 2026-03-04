@@ -46,8 +46,22 @@ div[data-testid="stMetric"] {
   background: var(--pastel-card);
   border: 1px solid var(--pastel-border);
   border-radius: 12px;
-  padding: 10px 12px;
+  padding: 14px 16px;
+  min-height: 120px;
   box-shadow: 0 4px 12px rgba(32, 33, 36, 0.06);
+}
+div[data-testid="stMetricValue"] {
+  font-size: 1.4rem;
+  line-height: 1.2;
+  white-space: normal !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+}
+div[data-testid="stMetricLabel"] {
+  font-size: 0.95rem;
+  white-space: normal !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
 }
 
 /* Inputs */
@@ -2369,15 +2383,35 @@ def render_roi_tab():
 
     st.markdown("---")
 
-    m1, m2, m3, m4 = st.columns(4, gap="large")
-    m1.metric("Unit cost (ROI)", _fmt_money(simbolo_base, unit_cost))
-    m2.metric("Monthly profit", _fmt_money(simbolo_base, profit_monthly))
-    m3.metric("Annual ROI", f"{annual_roi_pct:.1f}%")
+    def _roi_top_card(title: str, value: str) -> None:
+        st.markdown(
+            f"""
+            <div style="background:#ffffff;border:1px solid #e6e2f1;border-radius:14px;
+                        padding:14px 16px;box-shadow:0 6px 16px rgba(30, 30, 40, 0.06);
+                        min-height:110px;">
+              <div style="font-size:14px;color:#344054;font-weight:600;margin-bottom:6px;white-space:normal;">
+                {title}
+              </div>
+              <div style="font-size:24px;color:#1f2937;font-weight:700;line-height:1.15;white-space:normal;">
+                {value}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
-    if payback_months:
-        m4.metric("Payback (months)", f"{payback_months:.1f} mo")
-    else:
-        m4.metric("Payback (months)", "—")
+    m1, m2, m3, m4 = st.columns([1, 1, 1, 1], gap="large")
+    with m1:
+        _roi_top_card("Unit cost (ROI)", _fmt_money(simbolo_base, unit_cost))
+    with m2:
+        _roi_top_card("Monthly profit", _fmt_money(simbolo_base, profit_monthly))
+    with m3:
+        _roi_top_card("Annual ROI", f"{annual_roi_pct:.1f}%")
+    with m4:
+        if payback_months:
+            _roi_top_card("Payback (months)", f"{payback_months:.1f} mo")
+        else:
+            _roi_top_card("Payback (months)", "—")
 
     st.markdown("")
     resale_note = "Net investment (resale deducted)" if use_net_investment else "Terminal resale at end"
@@ -2388,6 +2422,9 @@ def render_roi_tab():
         )
 
     col_left, col_right = st.columns([1, 1], gap="large")
+    label_payback = "—"
+    payback_revenue = "—"
+    label_break = "—"
 
     with col_left:
         st.markdown("#### Breakeven and payback checkpoints")
@@ -2420,7 +2457,11 @@ def render_roi_tab():
                 alt.Chart(chart_long)
                 .mark_line(strokeWidth=3)
                 .encode(
-                    x=alt.X("pieces:Q", title="Pieces"),
+                    x=alt.X(
+                        "pieces:Q",
+                        title="Pieces",
+                        axis=alt.Axis(labelAngle=0, labelPadding=8, titlePadding=16, labelFontSize=11, titleFontSize=12),
+                    ),
                     y=alt.Y("value:Q", title=f"Amount ({simbolo_base})"),
                     color=alt.Color("series:N", legend=alt.Legend(title=None)),
                     tooltip=[
@@ -2451,24 +2492,18 @@ def render_roi_tab():
             else:
                 chart = line
 
-            st.altair_chart(chart.configure_view(stroke=None), use_container_width=True)
+            st.altair_chart(
+                chart.configure_view(stroke=None).properties(height=420, padding={"bottom": 18}),
+                use_container_width=True
+            )
 
             st.markdown("")
-            b1, b2, b3, b4 = st.columns(4, gap="large")
-            with b1:
-                label_payback = f"{float(pieces_to_payback):.0f} pcs" if has_payback else "—"
-                st.metric("Payback pieces", label_payback)
-            with b2:
-                payback_revenue = (
-                    _fmt_money(simbolo_base, float(selling_price) * float(pieces_to_payback))
-                    if has_payback else "—"
-                )
-                st.metric("Revenue at payback", payback_revenue)
-            with b3:
-                st.metric("Fixed monthly total", _fmt_money(simbolo_base, fixed_monthly_total))
-            with b4:
-                label_break = f"{float(breakeven_volume):.0f} pcs/mo" if has_breakeven else "—"
-                st.metric("Breakeven volume", label_break)
+            label_payback = f"{float(pieces_to_payback):.0f} pcs" if has_payback else "—"
+            payback_revenue = (
+                _fmt_money(simbolo_base, float(selling_price) * float(pieces_to_payback))
+                if has_payback else "—"
+            )
+            label_break = f"{float(breakeven_volume):.0f} pcs/mo" if has_breakeven else "—"
 
             st.caption(f"Net investment: {_fmt_money(simbolo_base, effective_investment)}")
 
@@ -2480,6 +2515,35 @@ def render_roi_tab():
             "Extra monthly costs are subtracted before ROI is calculated. "
             "Resale value can reduce the investment or be treated as a terminal cash inflow."
         )
+
+    def _roi_card_wide(title: str, value: str) -> None:
+        st.markdown(
+            f"""
+            <div style="background:#ffffff;border:1px solid #e6e2f1;border-radius:14px;
+                        padding:14px 16px;box-shadow:0 6px 16px rgba(30, 30, 40, 0.06);
+                        min-height:110px;">
+              <div style="font-size:14px;color:#344054;font-weight:600;margin-bottom:6px;white-space:normal;">
+                {title}
+              </div>
+              <div style="font-size:24px;color:#1f2937;font-weight:700;line-height:1.15;white-space:normal;">
+                {value}
+              </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    b1, b2, b3, b4 = st.columns([1, 1, 1, 1], gap="large")
+    with b1:
+        _roi_card_wide("Payback pieces", label_payback)
+    with b2:
+        _roi_card_wide("Revenue at payback", payback_revenue)
+    with b3:
+        _roi_card_wide("Fixed monthly total", _fmt_money(simbolo_base, fixed_monthly_total))
+    with b4:
+        _roi_card_wide("Breakeven volume", label_break)
+
+    st.markdown("")
 
     with st.expander("NPV (optional)", expanded=False):
         discount_rate = st.number_input(
@@ -2848,15 +2912,33 @@ def render_compare_tab():
     )
     screen_unit = (screen_total / qty_f) if qty_f > 0 else 0.0
 
+    def _render_metric_card(title: str, value: str, bg: str) -> None:
+        st.markdown(
+            f"""
+            <div style="background:{bg};border:1px solid #e6e2f1;border-radius:14px;
+                        padding:14px 16px;box-shadow:0 6px 16px rgba(30, 30, 40, 0.06);">
+              <div style="font-size:14px;color:#344054;font-weight:600;margin-bottom:6px;">{title}</div>
+              <div style="font-size:30px;color:#1f2937;font-weight:700;letter-spacing:0.2px;">{value}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
     s1, s2, s3 = st.columns(3, gap="large")
-    s1.metric("Digital unit cost", _fmt_money(simbolo_base, digital_unit_cost))
-    s2.metric("Screen unit cost", _fmt_money(simbolo_base, screen_unit))
-    s3.metric("Difference (Screen - Digital)", _fmt_money(simbolo_base, screen_unit - digital_unit_cost))
+    with s1:
+        _render_metric_card("Digital unit cost", _fmt_money(simbolo_base, digital_unit_cost), "#EAF2FF")
+    with s2:
+        _render_metric_card("Screen unit cost", _fmt_money(simbolo_base, screen_unit), "#E9F7F2")
+    with s3:
+        _render_metric_card("Difference (Screen - Digital)", _fmt_money(simbolo_base, screen_unit - digital_unit_cost), "#FFF3E8")
 
     t1, t2, t3 = st.columns(3, gap="large")
-    t1.metric("Digital total", _fmt_money(simbolo_base, digital_total))
-    t2.metric("Screen total", _fmt_money(simbolo_base, screen_total))
-    t3.metric("Total difference", _fmt_money(simbolo_base, screen_total - digital_total))
+    with t1:
+        _render_metric_card("Digital total", _fmt_money(simbolo_base, digital_total), "#F0ECFF")
+    with t2:
+        _render_metric_card("Screen total", _fmt_money(simbolo_base, screen_total), "#EAF6FF")
+    with t3:
+        _render_metric_card("Total difference", _fmt_money(simbolo_base, screen_total - digital_total), "#FFF0F4")
 
     fixed_screen = setup_labor_cost + screen_cost_total
     var_screen_unit = (
@@ -2941,6 +3023,138 @@ def render_compare_tab():
         st.write(f"Ink: {_fmt_money(simbolo_base, ink_cost_total)}")
         st.write(f"Energy: {_fmt_money(simbolo_base, energy_cost_total)}")
         st.write(f"Blank: {_fmt_money(simbolo_base, blank_cost_total)}")
+
+    # ---------------------------------------------------------
+    # Modern charts (comparison + structure)
+    # ---------------------------------------------------------
+    st.markdown("#### Visual Insights")
+    ch1, ch2 = st.columns(2, gap="large")
+
+    with ch1:
+        st.markdown("**Total Cost vs Volume**")
+        chart_df = df_vol.melt("Volume", var_name="Series", value_name="Cost")
+        chart_df = chart_df[chart_df["Series"].isin(["Digital Total", "Screen Total"])]
+        line = (
+            alt.Chart(chart_df)
+            .mark_line(point=True, strokeWidth=3)
+            .encode(
+                x=alt.X("Volume:Q", title="Volume (pcs)"),
+                y=alt.Y("Cost:Q", title=f"Total cost ({simbolo_base})"),
+                color=alt.Color("Series:N", legend=alt.Legend(title=None)),
+                tooltip=[
+                    alt.Tooltip("Volume:Q"),
+                    alt.Tooltip("Series:N"),
+                    alt.Tooltip("Cost:Q", format=".2f"),
+                ],
+            )
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+        )
+        st.altair_chart(line, use_container_width=True)
+
+    with ch2:
+        st.markdown("**Time Split (Setup vs Print)**")
+        time_df = pd.DataFrame(
+            [
+                {"Method": "Digital", "Phase": "Setup", "Hours": dtg_setup_hours},
+                {"Method": "Digital", "Phase": "Print", "Hours": dtg_print_hours},
+                {"Method": "Screen", "Phase": "Setup", "Hours": setup_hours},
+                {"Method": "Screen", "Phase": "Print", "Hours": print_hours},
+            ]
+        )
+        time_chart = (
+            alt.Chart(time_df)
+            .mark_bar(cornerRadius=8)
+            .encode(
+                x=alt.X("Method:N", title=None),
+                y=alt.Y("Hours:Q", title="Hours"),
+                color=alt.Color("Phase:N", legend=alt.Legend(title=None)),
+                tooltip=["Method", "Phase", alt.Tooltip("Hours:Q", format=".2f")],
+            )
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+        )
+        st.altair_chart(time_chart, use_container_width=True)
+
+    st.markdown("")
+    ch3, ch4 = st.columns(2, gap="large")
+
+    with ch3:
+        st.markdown("**Unit Cost Structure**")
+        digital_break = [
+            ("Labor", dtg_labor_cost),
+            ("Energy", dtg_energy_cost),
+            ("Ink", dtg_ink_cost),
+            ("Fixation", dtg_fix_cost),
+            ("Depreciation", dtg_dep_cost),
+            ("Service", dtg_service_cost),
+            ("Blank", dtg_blank_cost),
+            ("Extra", dtg_extra_cost),
+        ]
+        screen_break = [
+            ("Labor", setup_labor_cost + print_labor_cost),
+            ("Energy", energy_cost_total),
+            ("Ink", ink_cost_total),
+            ("Screens", screen_cost_total),
+            ("Depreciation", screen_dep_cost),
+            ("Service", screen_service_cost),
+            ("Blank", blank_cost_total),
+        ]
+        rows = []
+        for label, val in digital_break:
+            rows.append({"Method": "Digital", "Item": label, "UnitCost": (val / qty_f) if qty_f > 0 else 0.0})
+        for label, val in screen_break:
+            rows.append({"Method": "Screen", "Item": label, "UnitCost": (val / qty_f) if qty_f > 0 else 0.0})
+        df_struct = pd.DataFrame(rows)
+
+        struct_chart = (
+            alt.Chart(df_struct)
+            .mark_bar()
+            .encode(
+                x=alt.X("UnitCost:Q", title=f"Cost per piece ({simbolo_base})"),
+                y=alt.Y("Method:N", title=None),
+                color=alt.Color("Item:N", legend=alt.Legend(title=None)),
+                tooltip=["Method", "Item", alt.Tooltip("UnitCost:Q", format=".4f")],
+            )
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+        )
+        st.altair_chart(struct_chart, use_container_width=True)
+
+    with ch4:
+        st.markdown("**Break-even Sensitivity (Screen Colors)**")
+        colors_list = [max(1, int(colors - 2)), int(colors), int(colors + 2)]
+        rows = []
+        for c in colors_list:
+            c = max(1, c)
+            setup_h = (float(setup_time_per_color) * float(c)) / 60.0
+            screen_cost_fix = (setup_h * screen_labor_rate) + (float(c) * float(screen_cost_per_color))
+            screen_var_unit = (
+                (print_hours * screen_labor_rate)
+                + ink_cost_total
+                + energy_cost_total
+                + blank_cost_total
+                + screen_dep_cost
+                + screen_service_cost
+            ) / qty_f if qty_f > 0 else 0.0
+            if digital_unit_cost > screen_var_unit:
+                be = screen_cost_fix / (digital_unit_cost - screen_var_unit)
+            else:
+                be = None
+            rows.append({"Colors": c, "BreakEven": float(be) if be and be > 0 else None})
+        df_be = pd.DataFrame(rows)
+        be_chart = (
+            alt.Chart(df_be.dropna())
+            .mark_bar(cornerRadius=8)
+            .encode(
+                x=alt.X("Colors:O", title="Screen colors"),
+                y=alt.Y("BreakEven:Q", title="Break-even pcs"),
+                tooltip=["Colors", alt.Tooltip("BreakEven:Q", format=".0f")],
+            )
+            .configure_view(stroke=None)
+            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+        )
+        st.altair_chart(be_chart, use_container_width=True)
 #
 # ---------------------------------------------------------
 # Helpers: Unit cost breakdown rendering (robust + readable)
