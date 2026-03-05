@@ -5040,7 +5040,7 @@ def _get_tabs_password() -> str:
             return sec_pwd
     except Exception:
         pass
-    return "1234"
+    return "Racasana@2026"
 
 
 def require_tab_access(tab_key: str) -> bool:
