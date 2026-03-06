@@ -2606,10 +2606,12 @@ def render_compare_tab():
     # Backward compatibility: migrate old session keys from previous prefix.
     legacy_key_map = {
         "bepa_hours_week": "cmp_hours_week",
+        "bepa_fxr": "cmp_fxr",
         "bepa_labor_month": "cmp_labor_month",
         "bepa_ink_liter": "cmp_ink_liter",
         "bepa_screen_cost": "cmp_screen_cost",
         "bepa_setup_min": "cmp_setup_min",
+        "bepa_frame_prep_min": "cmp_frame_prep_min",
         "bepa_productivity": "cmp_productivity",
         "bepa_utilization_pct": "cmp_utilization_pct",
         "bepa_digital_setup_min": "cmp_digital_setup_min",
@@ -2633,6 +2635,27 @@ def render_compare_tab():
     # Inputs
     # ---------------------------------------------------------
     st.markdown("#### Inputs")
+    cfx1, cfx2 = st.columns(2, gap="large")
+    with cfx1:
+        cmp_currency_code = st.text_input(
+            "Local currency code",
+            value="MXN",
+            help="Currency used for local costs (examples: MXN, DOP, BRL, EUR).",
+            key="cmp_currency_code"
+        ).strip().upper()
+        if not cmp_currency_code:
+            cmp_currency_code = "LOCAL"
+        currency_label = cmp_currency_code.replace("$", r"\$")
+    with cfx2:
+        cmp_fxr = st.number_input(
+            f"FXR ({currency_label} per US\\$ 1.00)",
+            min_value=0.0001,
+            value=17.0,
+            step=0.1,
+            help="Exchange rate used to convert local costs to USD.",
+            key="cmp_fxr"
+        )
+
     i1, i2 = st.columns(2, gap="large")
     with i1:
         cmp_hours_week = st.number_input(
@@ -2644,11 +2667,11 @@ def render_compare_tab():
             key="cmp_hours_week"
         )
         cmp_labor_month = st.number_input(
-            "Labor cost monthly (USD)",
+            f"Labor cost monthly ({cmp_currency_code})",
             min_value=0.0,
             value=0.0,
             step=50.0,
-            help="Monthly labor cost used to estimate loaded hourly labor.",
+            help="Monthly labor cost in local currency. Converted to USD using FXR.",
             key="cmp_labor_month"
         )
         cmp_ink_liter = st.number_input(
@@ -2659,15 +2682,15 @@ def render_compare_tab():
             help="Ink cost per liter used in digital cost and matrix calculations.",
             key="cmp_ink_liter"
         )
-        st.caption("All costs in this tab are calculated in USD.")
+        st.caption("Outputs are in USD. Local labor and screen costs are converted using FXR.")
 
     with i2:
         cmp_screen_cost = st.number_input(
-            "Screen cost per frame (USD)",
+            f"Screen cost per frame ({cmp_currency_code})",
             min_value=0.0,
             value=120.0,
             step=1.0,
-            help="Cost per screen frame used in screen-printing setup.",
+            help="Screen frame cost in local currency. Converted to USD using FXR.",
             key="cmp_screen_cost"
         )
         cmp_setup_min = st.number_input(
@@ -2677,6 +2700,14 @@ def render_compare_tab():
             step=1.0,
             help="Setup minutes required per color for screen printing.",
             key="cmp_setup_min"
+        )
+        cmp_frame_prep_min = st.number_input(
+            "Frame prep time (min per frame/color)",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            help="Additional prep minutes per frame/color (film, cleaning, coating, etc.). Total prep = this value x number of colors.",
+            key="cmp_frame_prep_min"
         )
         cmp_productivity = st.number_input(
             "Productivity (imp/hr)",
@@ -2703,6 +2734,14 @@ def render_compare_tab():
             help="Fixed setup time used for digital printing.",
             key="cmp_digital_setup_min"
         )
+    fxr_safe = float(cmp_fxr) if float(cmp_fxr) > 0 else 1.0
+    labor_month_usd = float(cmp_labor_month) / fxr_safe
+    screen_cost_usd = float(cmp_screen_cost) / fxr_safe
+    setup_min_per_color_total = float(cmp_setup_min) + float(cmp_frame_prep_min)
+    st.caption(
+        f"Converted values -> Labor monthly: US$ {labor_month_usd:.2f} | "
+        f"Screen/frame: US$ {screen_cost_usd:.4f} | For direct USD input use currency `USD` and FXR `1.0`."
+    )
 
     # ---------------------------------------------------------
     # Lists and adjustments
@@ -2790,26 +2829,20 @@ def render_compare_tab():
     ml_list_sorted = sorted(set([float(v) for v in ml_list]))
     if "cmp_ml_piece" not in st.session_state or st.session_state["cmp_ml_piece"] not in ml_list_sorted:
         st.session_state["cmp_ml_piece"] = ml_list_sorted[0]
-    cmp_ml_piece = st.selectbox(
-        "Current mL",
-        options=ml_list_sorted,
-        index=ml_list_sorted.index(st.session_state["cmp_ml_piece"]),
-        help="Select one mL value from your configured list.",
-        key="cmp_ml_piece"
-    )
+    cmp_ml_piece = float(st.session_state["cmp_ml_piece"])
 
     labor_hour_loaded = 0.0
     if cmp_hours_week > 0:
-        labor_hour_loaded = float(cmp_labor_month) / (float(cmp_hours_week) * 52.0 / 12.0) * 1.44
+        labor_hour_loaded = float(labor_month_usd) / (float(cmp_hours_week) * 52.0 / 12.0) * 1.44
 
     matrix = []
     for ml in ml_list:
         row = {"mL": int(ml)}
         ink_cost_piece_ml = (float(ml) / 1000.0) * float(cmp_ink_liter)
         for c in colors_list:
-            setup_min_total = float(cmp_setup_min) * float(c)
+            setup_min_total = float(setup_min_per_color_total) * float(c)
             labor_setup_cost = (labor_hour_loaded * (setup_min_total / 60.0)) if labor_hour_loaded > 0 else 0.0
-            screens_cost = float(cmp_screen_cost) * float(c)
+            screens_cost = float(screen_cost_usd) * float(c)
             setup_total = labor_setup_cost + screens_cost
             impresiones = (setup_total / ink_cost_piece_ml) if ink_cost_piece_ml > 0 else 0.0
             row[str(int(c))] = float(impresiones)
@@ -2837,12 +2870,12 @@ def render_compare_tab():
         c7 = 7.0
         c8 = 8.0
 
-        setup_min_7 = float(cmp_setup_min) * c7
-        setup_min_8 = float(cmp_setup_min) * c8
+        setup_min_7 = float(setup_min_per_color_total) * c7
+        setup_min_8 = float(setup_min_per_color_total) * c8
         labor_setup_7 = (labor_hour_loaded * (setup_min_7 / 60.0)) if labor_hour_loaded > 0 else 0.0
         labor_setup_8 = (labor_hour_loaded * (setup_min_8 / 60.0)) if labor_hour_loaded > 0 else 0.0
-        screens_7 = float(cmp_screen_cost) * c7
-        screens_8 = float(cmp_screen_cost) * c8
+        screens_7 = float(screen_cost_usd) * c7
+        screens_8 = float(screen_cost_usd) * c8
         setup_total_7 = labor_setup_7 + screens_7
         setup_total_8 = labor_setup_8 + screens_8
 
@@ -2857,7 +2890,8 @@ def render_compare_tab():
             "How the app calculates Impressions values:\n"
             "- Cell formula: `Impressions = Total setup / Ink cost per piece`.\n"
             f"- `Ink cost per piece = (mL/1000) x Ink/Liter = (2/1000) x {float(cmp_ink_liter):.0f} = {ink_piece_2ml:.4f}`.\n"
-            f"- `Total setup (7 colors) = setup labor + screens = {labor_setup_7:.4f} + {screens_7:.4f} = {setup_total_7:.4f}`.\n"
+            f"- `Total setup (7 colors) = setup labor + screens (converted from {cmp_currency_code}) = "
+            f"{labor_setup_7:.4f} + {screens_7:.4f} = {setup_total_7:.4f}`.\n"
             f"- Value at row `2 mL` and column `7 colors`: `{setup_total_7:.4f} / {ink_piece_2ml:.4f} = {ex_190:.4f}` -> `{round(ex_190):.0f}`.\n"
             f"- Value at row `2 mL` and column `8 colors`: `{setup_total_8:.4f} / {ink_piece_2ml:.4f} = {ex_217:.4f}` -> `{round(ex_217):.0f}`.\n"
             f"- Value at row `3 mL` and column `7 colors`: `{setup_total_7:.4f} / {ink_piece_3ml:.4f} = {ex_127:.4f}` -> `{round(ex_127):.0f}`.\n"
@@ -2868,25 +2902,57 @@ def render_compare_tab():
         chart_df["Colors"] = pd.to_numeric(chart_df["Colors"], errors="coerce")
         chart_df["mL"] = pd.to_numeric(chart_df["mL"], errors="coerce")
         chart_df = chart_df.dropna()
-        chart_df = chart_df[chart_df["mL"] == float(cmp_ml_piece)]
-
-        line = (
-            alt.Chart(chart_df)
-            .mark_line(point=True, strokeWidth=3)
-            .encode(
-                x=alt.X("Colors:O", title="Number of colors"),
-                y=alt.Y("Impressions:Q", title="Impressions"),
-                color=alt.value("#f07c2a"),
-                tooltip=[
-                    alt.Tooltip("mL:Q"),
-                    alt.Tooltip("Colors:Q"),
-                    alt.Tooltip("Impressions:Q", format=".0f"),
-                ],
-            )
+        cmp_ml_piece = st.selectbox(
+            "Current mL",
+            options=ml_list_sorted,
+            index=ml_list_sorted.index(float(st.session_state["cmp_ml_piece"])),
+            help="Select one mL value from your configured list.",
+            key="cmp_ml_piece"
         )
+        cmp_ml_piece = float(cmp_ml_piece)
+        show_all_ml_lines = st.checkbox(
+            "Show all mL lines in chart",
+            value=False,
+            key="cmp_show_all_ml_lines",
+            help="Off: chart shows only selected mL. On: chart compares all mL lines."
+        )
+        chart_plot_df = chart_df.copy()
+        if not show_all_ml_lines:
+            chart_plot_df = chart_plot_df[chart_plot_df["mL"] == float(cmp_ml_piece)]
+
+        if show_all_ml_lines:
+            line = (
+                alt.Chart(chart_plot_df)
+                .mark_line(point=True, strokeWidth=2.5)
+                .encode(
+                    x=alt.X("Colors:O", title="Number of colors"),
+                    y=alt.Y("Impressions:Q", title="Break-even impressions (Setup cost / Ink cost per piece)"),
+                    color=alt.Color("mL:N", title="mL"),
+                    tooltip=[
+                        alt.Tooltip("mL:Q"),
+                        alt.Tooltip("Colors:Q"),
+                        alt.Tooltip("Impressions:Q", format=".0f"),
+                    ],
+                )
+            )
+        else:
+            line = (
+                alt.Chart(chart_plot_df)
+                .mark_line(point=True, strokeWidth=3)
+                .encode(
+                    x=alt.X("Colors:O", title="Number of colors"),
+                    y=alt.Y("Impressions:Q", title="Break-even impressions (Setup cost / Ink cost per piece)"),
+                    color=alt.value("#f07c2a"),
+                    tooltip=[
+                        alt.Tooltip("mL:Q"),
+                        alt.Tooltip("Colors:Q"),
+                        alt.Tooltip("Impressions:Q", format=".0f"),
+                    ],
+                )
+            )
 
         labels = (
-            alt.Chart(chart_df)
+            alt.Chart(chart_plot_df)
             .mark_text(dy=-10, fontSize=12, fontWeight="bold", color="#5c5c5c")
             .encode(
                 x=alt.X("Colors:O"),
@@ -2895,13 +2961,19 @@ def render_compare_tab():
             )
         )
 
+        chart_title = (
+            "Break-even impressions from setup cost per screen / ink cost per mL (all mL)"
+            if show_all_ml_lines
+            else "Break-even impressions from setup cost per screen / ink cost per mL (selected mL)"
+        )
         st.altair_chart(
-            (line + labels)
-            .properties(height=320, title="Break-even vs setup cost (selected mL)")
+            (line if show_all_ml_lines else (line + labels))
+            .properties(height=430, title=chart_title)
             .configure_view(stroke=None)
             .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4),
             use_container_width=True
         )
+        st.caption("This chart uses: Setup cost (screen/frame + setup labor) divided by ink cost per piece (mL x ink price).")
 
     st.markdown("#### Print modes (editable)")
     st.caption("Edit base Imp / hr here. The matrix below updates automatically.")
@@ -2948,6 +3020,10 @@ def render_compare_tab():
         val = float(mode_imp_hr) * eff_factor * ml_factor * colors_factor
         return max(val, 1.0)
 
+    def _production_during_setup_for_mode(mode_imp_hr: float, num_colors: float) -> float:
+        setup_minutes = float(setup_min_per_color_total) * float(num_colors)
+        return ((setup_minutes / 60.0) * float(mode_imp_hr) * eff_factor) if setup_minutes > 0 else 0.0
+
     pm_editor_rows = [
         {"Print Mode": mode_name, "Imp / hr (avg)": float(mode_imp_hr)}
         for mode_name, mode_imp_hr in mode_to_imp_hr.items()
@@ -2978,13 +3054,13 @@ def render_compare_tab():
         mode_to_imp_hr = dict(updated_map)
 
     st.markdown("#### Print Mode Matrix (mode x colors)")
-    st.caption("Calculated imp/hr by color count.")
+    st.caption("Calculated pieces produced during setup window by color count.")
 
     df_mode_matrix = []
     for mode_name, mode_imp_hr in mode_to_imp_hr.items():
         row = {"Print Mode": mode_name, "Imp / hr (avg)": float(mode_imp_hr)}
         for c in pm_colors_list:
-            row[str(int(c))] = float(_imp_hr_adjusted_for_mode(mode_imp_hr, float(c)))
+            row[str(int(c))] = float(_production_during_setup_for_mode(mode_imp_hr, float(c)))
         df_mode_matrix.append(row)
     df_mode_matrix = pd.DataFrame(df_mode_matrix)
 
@@ -3003,80 +3079,137 @@ def render_compare_tab():
         styled_mode = df_mode_show.style.apply(_highlight_mode, axis=1).format("{:.0f}")
         st.dataframe(styled_mode, use_container_width=True, height=290)
 
-        mode_sel = df_mode_matrix[df_mode_matrix["Print Mode"] == print_mode].copy()
-        if mode_sel.empty:
-            mode_sel = df_mode_matrix.iloc[[0]].copy()
-        mode_sel_row = mode_sel.iloc[0]
-        mode_chart_df = pd.DataFrame(
+        mode_chart_all_df = pd.DataFrame(
             [
                 {
+                    "Print Mode": str(mode_name),
                     "Colors": int(c),
-                    "Imp / hr": float(
-                        _imp_hr_adjusted_for_mode(
-                            float(mode_sel_row.get("Imp / hr (avg)", 0.0)),
-                            float(c),
-                        )
+                    "Setup min": float(setup_min_per_color_total) * float(c),
+                    "Base Imp / hr": float(mode_imp_hr),
+                    "Impressions during setup": float(
+                        _production_during_setup_for_mode(float(mode_imp_hr), float(c))
                     ),
                 }
+                for mode_name, mode_imp_hr in mode_to_imp_hr.items()
                 for c in pm_colors_list
             ]
         )
 
-        bar = (
-            alt.Chart(mode_chart_df)
-            .mark_bar(size=52, cornerRadius=6)
-            .encode(
-                x=alt.X("Colors:O", title="No. colors"),
-                y=alt.Y("Imp / hr:Q", title="Imp / hr"),
-                color=alt.value("#1f7a2e"),
-                tooltip=[
-                    alt.Tooltip("Colors:Q"),
-                    alt.Tooltip("Imp / hr:Q", format=".0f"),
-                ],
+        chart_controls_a, chart_controls_b = st.columns([0.35, 0.65], gap="large")
+        with chart_controls_a:
+            show_all_modes = st.checkbox(
+                "Show all print modes in chart",
+                value=False,
+                key="cmp_show_all_modes_chart",
             )
-        )
-
-        bar_labels = (
-            alt.Chart(mode_chart_df)
-            .mark_text(dy=-10, fontSize=12, fontWeight="bold", color="#4b4b4b")
-            .encode(
-                x=alt.X("Colors:O"),
-                y=alt.Y("Imp / hr:Q"),
-                text=alt.Text("Imp / hr:Q", format=".0f"),
+        with chart_controls_b:
+            chart_mode_sel = st.selectbox(
+                "Chart print mode",
+                options=list(mode_to_imp_hr.keys()),
+                index=list(mode_to_imp_hr.keys()).index(print_mode) if print_mode in mode_to_imp_hr else 0,
+                key="cmp_chart_mode_sel",
             )
-        )
 
-        st.altair_chart(
-            (bar + bar_labels)
-            .properties(height=330, title=f"Production during setup ({print_mode})")
-            .configure_view(stroke=None)
-            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4),
-            use_container_width=True
+        st.caption(
+            "Each bar shows how many pieces can be printed during the total setup window for that color count: "
+            "`Impressions during setup = ((Colors x Setup min per color) / 60) x Base Imp/hr x Efficiency`."
         )
+        if show_all_modes:
+            line_modes = (
+                alt.Chart(mode_chart_all_df)
+                .mark_line(point=True, strokeWidth=2.5)
+                .encode(
+                    x=alt.X("Colors:O", title="No. colors"),
+                    y=alt.Y("Impressions during setup:Q", title="Impressions during setup (pcs)"),
+                    color=alt.Color("Print Mode:N", title="Print mode"),
+                    tooltip=[
+                        alt.Tooltip("Print Mode:N"),
+                        alt.Tooltip("Colors:Q"),
+                        alt.Tooltip("Setup min:Q", format=".0f"),
+                        alt.Tooltip("Base Imp / hr:Q", format=".0f"),
+                        alt.Tooltip("Impressions during setup:Q", format=".0f"),
+                    ],
+                )
+            )
+            st.altair_chart(
+                line_modes
+                .properties(height=380, title="Impressions produced during setup window (all print modes)")
+                .configure_view(stroke=None)
+                .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4),
+                use_container_width=True
+            )
+        else:
+            mode_chart_df = mode_chart_all_df[mode_chart_all_df["Print Mode"] == str(chart_mode_sel)].copy()
+            bar = (
+                alt.Chart(mode_chart_df)
+                .mark_bar(size=52, cornerRadius=6)
+                .encode(
+                    x=alt.X("Colors:O", title="No. colors"),
+                    y=alt.Y("Impressions during setup:Q", title="Impressions during setup (pcs)"),
+                    color=alt.value("#1f7a2e"),
+                    tooltip=[
+                        alt.Tooltip("Colors:Q"),
+                        alt.Tooltip("Setup min:Q", format=".0f"),
+                        alt.Tooltip("Base Imp / hr:Q", format=".0f"),
+                        alt.Tooltip("Impressions during setup:Q", format=".0f"),
+                    ],
+                )
+            )
 
-    st.markdown("#### Formula: Adjusted imp/hr (avg)")
+            bar_labels = (
+                alt.Chart(mode_chart_df)
+                .mark_text(dy=-10, fontSize=12, fontWeight="bold", color="#4b4b4b")
+                .encode(
+                    x=alt.X("Colors:O"),
+                    y=alt.Y("Impressions during setup:Q"),
+                    text=alt.Text("Impressions during setup:Q", format=".0f"),
+                )
+            )
+
+            st.altair_chart(
+                (bar + bar_labels)
+                .properties(height=380, title=f"Impressions produced during setup window ({chart_mode_sel})")
+                .configure_view(stroke=None)
+                .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4),
+                use_container_width=True
+            )
+
+    st.markdown("#### Formula: Production during setup")
     st.code(
-        "Imp_hr = Base_mode × Efficiency × (mL_ref / mL) × (Colors_ref / Colors)",
+        "Impressions_setup = ((Colors × Setup_min_per_color) / 60) × Base_mode_imp_hr × Efficiency",
         language="text"
     )
     st.caption(
         f"Base_mode={base_imp_hr_mode:.2f} | Efficiency={cmp_utilization_pct:.1f}% ({eff_factor:.3f}) | "
-        f"mL_ref={float(ml_ref):.2f} | mL={float(cmp_ml_piece):.2f} | "
-        f"Colors_ref={int(colors_ref)}"
+        f"Setup_min_per_color={float(cmp_setup_min):.2f} | Frame_prep_min_per_color={float(cmp_frame_prep_min):.2f} | "
+        f"Total_setup_min_per_color={float(setup_min_per_color_total):.2f}"
     )
+    st.markdown("#### Formula: Adjusted imp/hr")
+    st.code("Imp_hr = Base_mode × Efficiency × (mL_ref / mL) × (Colors_ref / Colors)", language="text")
     current_colors_factor = (float(colors_ref) / float(scale_colors)) if float(scale_colors) > 0 else 1.0
     current_imp_hr = _imp_hr_adjusted(float(scale_colors))
     st.caption(
         f"Current factors -> ml_factor={ml_factor:.3f} | colors_factor={current_colors_factor:.3f} | "
         f"Imp/hr (colors={int(scale_colors)}): {current_imp_hr:.2f}"
     )
+    crossover_default_colors = int(max(pm_colors_list)) if pm_colors_list else int(scale_colors)
+    if "cmp_cross_colors" not in st.session_state:
+        st.session_state["cmp_cross_colors"] = crossover_default_colors
+    crossover_colors = st.number_input(
+        "Crossover number of colors",
+        min_value=1,
+        value=int(st.session_state.get("cmp_cross_colors", crossover_default_colors)),
+        step=1,
+        help="Color count used in Crossover Summary, Detailed Scale Table, and Crossover Point chart.",
+        key="cmp_cross_colors"
+    )
 
     serig_rows = []
     for vol in scale_volumes:
-        setup_min_total = float(cmp_setup_min) * float(scale_colors)
+        setup_min_total = float(setup_min_per_color_total) * float(crossover_colors)
         print_min = (float(vol) / float(cmp_productivity)) * 60.0 if cmp_productivity > 0 else 0.0
         total_min = setup_min_total + print_min
-        screens_cost = float(scale_colors) * float(cmp_screen_cost)
+        screens_cost = float(crossover_colors) * float(screen_cost_usd)
         setup_labor = (setup_min_total / 60.0) * labor_hour_loaded if labor_hour_loaded > 0 else 0.0
         print_labor = (print_min / 60.0) * labor_hour_loaded if labor_hour_loaded > 0 else 0.0
         total_cost = screens_cost + setup_labor + print_labor
@@ -3094,8 +3227,11 @@ def render_compare_tab():
     digital_rows = []
     for vol in scale_volumes:
         setup_min_total = float(cmp_digital_setup_min)
-        imp_hr_mode = _imp_hr_adjusted(float(scale_colors))
-        print_min = (float(vol) / float(imp_hr_mode)) * 60.0 if imp_hr_mode > 0 else 0.0
+        # Spreadsheet parity for Digital scale block:
+        # Printing min = (Volume / Base_mode_imp_hr) * Efficiency * 60
+        # where Base_mode_imp_hr comes from selected print mode.
+        base_mode_for_digital = float(base_imp_hr_mode) if float(base_imp_hr_mode) > 0 else 1.0
+        print_min = (float(vol) / float(base_mode_for_digital)) * eff_factor * 60.0 if base_mode_for_digital > 0 else 0.0
         total_min = setup_min_total + print_min
         ink_total = (float(vol) * float(cmp_ml_piece) / 1000.0) * float(cmp_ink_liter)
         setup_labor = (setup_min_total / 60.0) * labor_hour_loaded if labor_hour_loaded > 0 else 0.0
@@ -3113,6 +3249,13 @@ def render_compare_tab():
     df_digital = pd.DataFrame(digital_rows)
 
     st.markdown("#### Comparison")
+    st.caption(
+        f"Active parameters for this section -> Print Mode: {print_mode} | Number of colors (crossover): {int(crossover_colors)} | "
+        f"Base mode imp/hr: {base_imp_hr_mode:.2f} | Efficiency: {cmp_utilization_pct:.1f}%"
+    )
+    st.caption(
+        f"Digital printing minutes use -> Printing min = (Volume / {base_imp_hr_mode:.2f}) x {eff_factor:.3f} x 60"
+    )
     if st.button("Reset Inputs", type="secondary", key="cmp_reset"):
         for k in list(st.session_state.keys()):
             if k.startswith("cmp_") or k.startswith("bepa_"):
@@ -3129,12 +3272,47 @@ def render_compare_tab():
         df_cmp["Digital Unit"] = df_cmp["Digital Total"] / df_cmp["Volume"]
         df_cmp["Delta (Screen-Digital)"] = df_cmp["Screen Total"] - df_cmp["Digital Total"]
 
-        df_show = df_cmp.copy()
-        df_show["Screen Total"] = df_show["Screen Total"].apply(lambda v: _fmt_money("US$", float(v)))
-        df_show["Digital Total"] = df_show["Digital Total"].apply(lambda v: _fmt_money("US$", float(v)))
-        df_show["Screen Unit"] = df_show["Screen Unit"].apply(lambda v: _fmt_money("US$", float(v)))
-        df_show["Digital Unit"] = df_show["Digital Unit"].apply(lambda v: _fmt_money("US$", float(v)))
-        st.dataframe(df_show, use_container_width=True, height=260)
+        st.markdown("#### Crossover Summary (scale)")
+        summary_row_screen = {"Method": "Screen Printing"}
+        summary_row_digital = {"Method": "Digital"}
+        for _, r in df_cmp.iterrows():
+            vol_key = str(int(r["Volume"]))
+            summary_row_screen[vol_key] = _fmt_money("US$", float(r["Screen Total"]))
+            summary_row_digital[vol_key] = _fmt_money("US$", float(r["Digital Total"]))
+        df_summary = pd.DataFrame([summary_row_screen, summary_row_digital])
+        st.dataframe(df_summary, use_container_width=True, height=145)
+
+        st.markdown("#### Detailed Scale Table")
+        detail_rows = []
+        row_setup_screen = {"Item": "Screen Printing - Setup"}
+        row_print_screen = {"Item": "Screen Printing - Printing"}
+        row_total_screen = {"Item": "Screen Printing - Total mins"}
+        row_cost_screen = {"Item": "Screen Printing - Cost"}
+        row_setup_digital = {"Item": "Digital - Setup"}
+        row_print_digital = {"Item": "Digital - Printing"}
+        row_total_digital = {"Item": "Digital - Total mins"}
+        row_cost_digital = {"Item": "Digital - Cost"}
+        for i in range(len(df_cmp)):
+            vol_key = str(int(df_cmp.iloc[i]["Volume"]))
+            row_setup_screen[vol_key] = round(float(df_serig.iloc[i]["Setup min"]))
+            row_print_screen[vol_key] = round(float(df_serig.iloc[i]["Print min"]))
+            row_total_screen[vol_key] = round(float(df_serig.iloc[i]["Total min"]))
+            row_cost_screen[vol_key] = _fmt_money("US$", float(df_serig.iloc[i]["Total"]))
+            row_setup_digital[vol_key] = round(float(df_digital.iloc[i]["Setup min"]))
+            row_print_digital[vol_key] = round(float(df_digital.iloc[i]["Print min"]))
+            row_total_digital[vol_key] = round(float(df_digital.iloc[i]["Total min"]))
+            row_cost_digital[vol_key] = _fmt_money("US$", float(df_digital.iloc[i]["Total"]))
+        detail_rows.extend([
+            row_setup_screen,
+            row_print_screen,
+            row_total_screen,
+            row_cost_screen,
+            row_setup_digital,
+            row_print_digital,
+            row_total_digital,
+            row_cost_digital,
+        ])
+        st.dataframe(pd.DataFrame(detail_rows), use_container_width=True, height=290)
 
         break_even_volume = None
         break_even_cost = None
@@ -3181,7 +3359,7 @@ def render_compare_tab():
             alt.Chart(chart_df)
             .mark_line(point=True, strokeWidth=3)
             .encode(
-                x=alt.X("Volume:Q", title="Volume (pcs)"),
+                x=alt.X("Volume:Q", title="Volume (pcs)", axis=alt.Axis(titlePadding=18, labelPadding=8)),
                 y=alt.Y("Cost:Q", title="Total cost (US$)"),
                 color=alt.Color("Series:N", legend=alt.Legend(title=None)),
                 tooltip=[
@@ -3190,8 +3368,7 @@ def render_compare_tab():
                     alt.Tooltip("Cost:Q", format=".2f"),
                 ],
             )
-            .configure_view(stroke=None)
-            .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+            .properties(height=620, title="Crossover Point")
         )
         if break_even_volume is not None:
             rule_df = pd.DataFrame([{"Volume": float(break_even_volume), "Label": f"Break-even ~ {break_even_volume:.1f}"}])
@@ -3210,9 +3387,20 @@ def render_compare_tab():
                 y=alt.value(18),
                 text="Label:N",
             )
-            st.altair_chart((chart + rule + rule_label), use_container_width=True)
+            layered_chart = (
+                (chart + rule + rule_label)
+                .properties(padding={"bottom": 42})
+                .configure_view(stroke=None)
+                .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+            )
+            st.altair_chart(layered_chart, use_container_width=True)
         else:
-            st.altair_chart(chart, use_container_width=True)
+            single_chart = (
+                chart.properties(padding={"bottom": 42})
+                .configure_view(stroke=None)
+                .configure_axis(grid=True, gridColor="#dfe3e8", gridOpacity=0.4)
+            )
+            st.altair_chart(single_chart, use_container_width=True)
 
 def _safe_float(v, default: float = 0.0) -> float:
     try:
